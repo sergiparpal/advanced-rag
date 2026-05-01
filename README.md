@@ -191,7 +191,7 @@ doesn't abort the whole run.
 
 ## Repository layout
 
-See `BUILD.md` §4 for the full layout. The Hermes-coupled surface is just
+See `REQUIREMENTS.md` §3.2 for the full layout. The Hermes-coupled surface is just
 `advanced_rag/__init__.py::register` and `advanced_rag/adapters.py`.
 Every other module is pure and unit-tested.
 

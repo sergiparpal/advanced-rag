@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A **Hermes Agent plugin** that combines Advanced RAG (smart recursive chunking, hybrid BM25 + dense + RRF, query expansion, reranking) with Hierarchical RAG (embed small chunks, return their parent units). The deployable artifact is the inner `advanced_rag/` package — that whole directory is what gets `rsync`'d to `~/.hermes/plugins/advanced-rag/` on the runtime machine.
 
-`README.md` is user-facing. `BUILD.md` is the build plan and the single source of truth for module responsibilities, DDL, and acceptance criteria. `HERMES_API.md` is the verified Hermes plugin signatures — when something at the adapter layer doesn't behave as expected, check it against `HERMES_API.md` before assuming bugs.
+`README.md` is user-facing. `REQUIREMENTS.md` is the authoritative spec — the single source of truth for module responsibilities, DDL, invariants, and acceptance criteria. `HERMES_API.md` is the verified Hermes plugin signatures — when something at the adapter layer doesn't behave as expected, check it against `HERMES_API.md` before assuming bugs.
 
 ## Dev machine ≠ runtime machine
 
