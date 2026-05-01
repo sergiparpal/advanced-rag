@@ -208,8 +208,8 @@ fields. Convention is strings; document each env var in the README.
 | API | Verified status |
 |---|---|
 | `register_tool` | ✅ Compatible. Extra optional kwargs: `check_fn`, `requires_env`, `is_async`, `description`, `emoji`. |
-| `register_hook("pre_llm_call", fn)` | ✅ Match. Real kwargs include extra `sender_id` (absorbed by `**kwargs`). Return `{"context": str}` or plain string. |
-| `register_hook("on_session_start", fn)` | ✅ **Available** — kwargs `session_id, model, platform`. Fires only on new sessions. Used in v0.1 for engine warming. |
+| `register_hook("pre_llm_call", fn)` | ✅ Compatible. Real kwargs include extra `sender_id` (absorbed by `**kwargs`). Return `{"context": str}` or plain string. |
+| `register_hook("on_session_start", fn)` | ✅ Compatible. Kwargs `session_id, model, platform`. Fires only on new sessions. Used in v0.1 for engine warming. |
 | `register_cli_command` | ✅ Compatible. `handler_fn` is optional; new `description` kwarg. |
 | `register_command` (slash) | ⚠️ Handler is `(raw_args: str) -> str \| None` — **no kwargs**. Per-session toggle impossible. |
 | `register_skill` | 🔴 `path` must be `pathlib.Path`, not `str`. New `description` kwarg available. |
