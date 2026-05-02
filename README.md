@@ -181,9 +181,17 @@ used). The plugin never blocks on a missing key.
 `toggles.json` can't be parsed, ambient injection stays on. Delete the file or
 run `/rag on` to rewrite it.
 
-**Indexer skips a file you changed.** The diff is keyed on `(mtime, size)`.
-Touching a file without changing its size leaves the diff intact. Use
-`hermes rag index <path> --force` to reprocess everything.
+**Indexer skips a file you changed.** The diff first checks `(mtime, size)`;
+on a hit it falls back to a SHA-256 content hash, so an in-place edit that
+preserved both fields still gets picked up. If the file is genuinely identical
+(same bytes, same stat) it is skipped; otherwise reindexed. Use
+`hermes rag index <path> --force` to reprocess everything regardless.
+
+**Markdown intro / TL;DR seems to be missing.** `extract_md` splits on `## `
+headings. Text before the first `## ` becomes a synthetic *preamble* parent only
+if it has at least `PREAMBLE_MIN_CHARS` (default 200) of body content; shorter
+prefixes are dropped as boilerplate. Lower the threshold (or add a `## Overview`
+heading) if your intro is shorter and you want it indexed.
 
 **PDF support missing.** `pip install pypdf` (or include the `pdf` extra).
 Indexing a `.pdf` without `pypdf` raises `IndexingError` for that file but

@@ -11,7 +11,10 @@ provides_tools:
 provides_hooks:
   - pre_llm_call
   - on_session_start
-requires_env:
-  - COHERE_API_KEY
-  - ANTHROPIC_API_KEY
-  - HERMES_RAG_DATA_DIR
+# `requires_env` deliberately omitted: the plugin runs with zero env vars set.
+# All three vars below are optional and degrade gracefully when missing.
+# Listed as documentation only; Hermes does not parse this key.
+optional_env:
+  - COHERE_API_KEY        # Cohere reranker; falls back to local cross-encoder.
+  - ANTHROPIC_API_KEY     # Query expansion; falls back to no expansion.
+  - HERMES_RAG_DATA_DIR   # Override data dir; defaults to ~/.hermes/...

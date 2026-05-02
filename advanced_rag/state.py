@@ -11,6 +11,13 @@ from pathlib import Path
 from .config import toggles_path
 
 _DEFAULT_KEY = "_default"
+# Module-level cache. Deliberately unsynchronized: races between concurrent
+# _load/_store can leave a stale dict in `_CACHE`, but the worst case is
+# exactly one wrong toggle read within the 1-second TTL. `is_ambient_enabled`
+# fails open (errors → True), so a torn read at most disables/enables ambient
+# context for a single LLM turn — never raises, never corrupts the file.
+# Adding a lock here would defeat the purpose of the cache (every read would
+# serialize). Keep this contract in mind before refactoring.
 _CACHE: dict | None = None
 _CACHE_TS: float = 0.0
 _CACHE_PATH: Path | None = None

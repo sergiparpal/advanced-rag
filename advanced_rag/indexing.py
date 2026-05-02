@@ -5,10 +5,14 @@ from the canonical SQLite chunk ordering.
 from __future__ import annotations
 
 import hashlib
+import logging
+import sys
 import time
 from pathlib import Path
 
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 from .chunking import recursive_split
 from .config import (
@@ -111,14 +115,19 @@ def index_path(path, force: bool = False, store: Store | None = None,
 
     files = _walk(root)
     disk_map = {p: p.stat() for p in files}
-    diff = own_store.manifest_diff(disk_map)
+    # Pass `_hash_file` as the (mtime, size) tiebreaker so in-place edits that
+    # preserved both fields still get reindexed. Cost: one SHA-256 per file
+    # whose (mtime, size) match — files with stale stats short-circuit.
+    diff = own_store.manifest_diff(disk_map, hash_fn=_hash_file)
 
     if force:
-        # treat everything found on disk as changed
-        changed_now = [(p, _existing_id_for(own_store, p)) for p in files]
-        # filter Nones: if not in db yet, route through "new"
-        new_now = [p for p, fid in changed_now if fid is None] + diff["new"]
-        changed_now = [(p, fid) for p, fid in changed_now if fid is not None]
+        # In force mode, every file on disk is treated as changed (or new if
+        # absent from the catalog). One SQL fetch covers both buckets — no
+        # per-file `_existing_id_for` round-trip.
+        existing_ids = {Path(r["path"]): r["id"]
+                        for r in own_store.connect().execute("SELECT id, path FROM files")}
+        changed_now = [(p, existing_ids[p]) for p in files if p in existing_ids]
+        new_now = [p for p in files if p not in existing_ids]
         deleted_ids = diff["deleted"]
         unchanged_now: list[Path] = []
     else:
@@ -131,15 +140,8 @@ def index_path(path, force: bool = False, store: Store | None = None,
     obsolete = list(deleted_ids) + [fid for _, fid in changed_now]
     own_store.delete_files(obsolete)
 
-    # then inserts: changed (now treated as new) + new
-    to_insert = [p for _, p in [(fid, p) for p, fid in changed_now]] + new_now
-    # dedup paths but preserve order
-    seen = set()
-    ordered_inserts: list[Path] = []
-    for p in to_insert:
-        if p not in seen:
-            seen.add(p)
-            ordered_inserts.append(p)
+    # changed paths get reinserted; new paths fall straight through
+    ordered_inserts = [p for p, _ in changed_now] + new_now
 
     new_files = 0
     new_parents = 0
@@ -148,8 +150,10 @@ def index_path(path, force: bool = False, store: Store | None = None,
         try:
             _, pn, cn = _index_file(own_store, p)
         except Exception as e:
-            # Skip the file but keep going. Surface the error in the summary.
-            print(f"[advanced-rag] failed to index {p}: {e}")
+            # Skip the file but keep going. Warning goes to stderr so the CLI's
+            # JSON summary on stdout stays parseable.
+            log.warning("failed to index %s: %s", p, e)
+            print(f"[advanced-rag] failed to index {p}: {e}", file=sys.stderr)
             continue
         new_files += 1
         new_parents += pn
@@ -176,12 +180,6 @@ def index_path(path, force: bool = False, store: Store | None = None,
     }
 
 
-def _existing_id_for(store: Store, path: Path) -> int | None:
-    conn = store.connect()
-    r = conn.execute("SELECT id FROM files WHERE path = ?", (str(path),)).fetchone()
-    return r["id"] if r else None
-
-
 def rebuild_artifacts(store: Store, embedder) -> None:
     """Rebuild embeddings.npz and bm25.pkl from the canonical SQLite chunk
     order. Also rewrites each chunk's `embed_row` so row N of the embeddings
@@ -203,11 +201,16 @@ def rebuild_artifacts(store: Store, embedder) -> None:
     if embeddings.shape[0] != len(texts):
         raise RuntimeError("embedder returned wrong number of vectors")
 
-    store.save_embeddings(npz_path(store.data_dir), embeddings, chunk_ids)
-
     tokenized = [_tokenize(t) for t in texts]
     bm25 = BM25Okapi(tokenized)
-    store.save_bm25(bm25_path(store.data_dir), bm25)
+
+    # Stage both .tmp files first, then commit back-to-back: embeddings.npz
+    # and bm25.pkl land within microseconds of each other instead of "two
+    # independent atomic writes" with a multi-millisecond gap between them.
+    store.save_artifacts(
+        npz_path(store.data_dir), embeddings,
+        bm25_path(store.data_dir), bm25,
+    )
 
     # canonical row-index ↔ chunk_id mapping into SQLite
     store.bulk_update_embed_rows([(cid, row) for row, cid in enumerate(chunk_ids)])

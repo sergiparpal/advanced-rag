@@ -31,6 +31,14 @@ class FakeStore:
     def parent_id_for_chunk(self, chunk_id):
         return self.chunk_to_parent.get(chunk_id)
 
+    def parent_ids_for_chunks(self, chunk_ids):
+        out = {}
+        for cid in chunk_ids:
+            pid = self.chunk_to_parent.get(cid)
+            if pid is not None:
+                out[cid] = pid
+        return out
+
     def get_parent(self, parent_id):
         p = self.parents.get(parent_id)
         if p is None:
@@ -39,6 +47,10 @@ class FakeStore:
             "id": p.id, "title": p.title, "kind": p.kind, "text": p.text,
             "page_no": p.page_no, "source_path": p.source_path,
         }
+
+    def get_parents(self, parent_ids):
+        return {pid: row for pid in parent_ids
+                if (row := self.get_parent(pid)) is not None}
 
 
 class FakeEngine:

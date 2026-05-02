@@ -62,3 +62,39 @@ def test_falls_back_on_unparseable_json(mock_anthropic):
 def test_empty_query_returns_empty_list():
     assert expand_query("") == []
     assert expand_query("   ") == ["   "]
+
+
+def test_paraphrases_dedupe_against_query_and_each_other(mock_anthropic):
+    import types
+    mock_anthropic.Anthropic = lambda *a, **kw: types.SimpleNamespace(
+        messages=types.SimpleNamespace(create=lambda **kw: types.SimpleNamespace(
+            content=[types.SimpleNamespace(
+                text='{"paraphrases": ["hello world", "FOO ", "foo", "bar"], "hyde": "h"}'
+            )]
+        ))
+    )
+    out = expand_query("hello world")
+    # original query stays; "hello world" duplicate dropped; "FOO " and "foo"
+    # collapse to one entry; "bar" comes through; hyde appended.
+    assert out[0] == "hello world"
+    lower = [s.lower() for s in out]
+    assert lower.count("hello world") == 1
+    assert lower.count("foo") == 1
+    assert "bar" in out
+    assert out[-1] == "h"
+
+
+def test_anthropic_client_is_cached_across_calls(mock_anthropic):
+    """L9: the SDK client is reused; one constructor call covers many queries."""
+    constructions = {"n": 0}
+    real_client = mock_anthropic.Anthropic
+
+    def counting_ctor(*a, **kw):
+        constructions["n"] += 1
+        return real_client(*a, **kw)
+
+    mock_anthropic.Anthropic = counting_ctor
+    expand_query("first")
+    expand_query("second")
+    expand_query("third")
+    assert constructions["n"] == 1

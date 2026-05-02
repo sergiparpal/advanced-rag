@@ -126,6 +126,14 @@ def mock_anthropic(monkeypatch):
     mod.Anthropic = _Client
     monkeypatch.setitem(sys.modules, "anthropic", mod)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    # The expansion module caches the Anthropic client at import — reset it
+    # so each test sees a fresh constructor (the tests rebind `mod.Anthropic`
+    # mid-run to swap response shapes).
+    try:
+        import advanced_rag.expansion as _exp
+        _exp._reset_anthropic_client_for_tests()
+    except ImportError:
+        pass
     return mod
 
 

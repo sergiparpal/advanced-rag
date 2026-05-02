@@ -10,7 +10,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import MAX_PARENT_CHARS
+from .config import MAX_PARENT_CHARS, PREAMBLE_MIN_CHARS
 
 PdfReader = None  # patched by tests; lazily imported in extract_pdf
 
@@ -21,19 +21,54 @@ class IndexingError(RuntimeError):
 
 @dataclass
 class Parent:
-    kind: str                  # 'section' | 'page' | 'paragraph_group'
+    kind: str                  # 'section' | 'page' | 'paragraph_group' | 'preamble'
     title: str | None
     text: str
     page_no: int | None = None
 
 
 _H2_RE = re.compile(r"^##\s+", re.MULTILINE)
+_H1_RE = re.compile(r"^#\s+(.+?)\s*$", re.MULTILINE)
 _PARA_SPLIT_RE = re.compile(r"\n\s*\n")
 
 
-def extract_md(text: str) -> list[Parent]:
+def _build_preamble(prefix: str, min_body_chars: int) -> Parent | None:
+    """Capture text before the first `##` heading as a synthetic parent.
+
+    Returns None if the prefix is empty/whitespace, or if the body (after
+    lifting a leading `# H1` line out as the title) is shorter than
+    ``min_body_chars`` — that case is almost always boilerplate (a lone title
+    line, a one-line status note) and not worth a parent of its own.
+    """
+    if not prefix or not prefix.strip():
+        return None
+    title: str | None = None
+    h1 = _H1_RE.search(prefix)
+    if h1 is not None:
+        title = h1.group(1).strip()
+        # body is everything else in the prefix, with the H1 line removed
+        body = (prefix[: h1.start()] + prefix[h1.end():]).strip()
+    else:
+        body = prefix.strip()
+    if len(body) < min_body_chars:
+        return None
+    full = (title + "\n" + body) if title else body
+    return Parent(kind="preamble", title=title, text=full.strip())
+
+
+def extract_md(text: str, preamble_min_chars: int = PREAMBLE_MIN_CHARS) -> list[Parent]:
     """Split on `## ` (level-2) lines. Each parent's title is the literal
     heading line; kind="section". If zero level-2 headings, defer to extract_txt.
+
+    Text preceding the first `##` heading (TL;DRs, abstracts, content under a
+    lone `# H1`) is captured as a synthetic "preamble" parent when its body
+    clears ``preamble_min_chars`` — otherwise it is dropped to avoid indexing
+    boilerplate.
+
+    **Known v0.1 limitation:** the regex is line-oriented and not aware of
+    fenced code blocks (``` ... ``` / ~~~), so an unindented ``##`` *inside* a
+    fenced block is treated as a section break. Real-world Python/shell/MDX
+    samples can trip this. A code-fence-aware splitter is planned for v0.2.
     """
     if text is None or not text.strip():
         return []
@@ -43,6 +78,9 @@ def extract_md(text: str) -> list[Parent]:
 
     parents: list[Parent] = []
     starts = [m.start() for m in matches]
+    preamble = _build_preamble(text[: starts[0]], preamble_min_chars)
+    if preamble is not None:
+        parents.append(preamble)
     starts.append(len(text))
     for i, start in enumerate(starts[:-1]):
         end = starts[i + 1]
@@ -89,7 +127,6 @@ def extract_pdf(path: Path) -> list[Parent]:
     """One parent per page with kind='page'. Test-friendly: if the module-level
     `PdfReader` was monkey-patched, that's used; otherwise we try to import
     pypdf and raise IndexingError if it's missing."""
-    global PdfReader
     reader_cls = PdfReader
     if reader_cls is None:
         try:

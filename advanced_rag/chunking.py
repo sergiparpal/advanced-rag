@@ -45,7 +45,14 @@ def recursive_split(
 ) -> list[str]:
     """Greedy pack of split parts; recurses on remaining separator list when a
     single part overflows; falls through to fixed-size hard split with overlap
-    when no separator works."""
+    when no separator works.
+
+    **Bound:** with ``overlap == 0`` every chunk satisfies ``len(c) <= max_size``.
+    With ``overlap > 0`` the post-pass prepends the previous chunk's tail to
+    each successor and accepts merges up to ``max_size + overlap`` chars — so
+    callers must size buffers against ``max_size + overlap``, not ``max_size``
+    alone. The parent cap (``MAX_PARENT_CHARS``) absorbs the slop downstream.
+    """
     if text is None:
         return []
     if not text.strip():

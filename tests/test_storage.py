@@ -54,6 +54,45 @@ def test_manifest_diff_buckets(tmp_data_dir, tmp_path):
     assert len(diff["deleted"]) == 1
 
 
+def test_manifest_diff_hash_tiebreaker_detects_in_place_edit(tmp_data_dir, tmp_path):
+    """When (mtime, size) match, the hash callback decides changed vs unchanged."""
+    store = Store()
+    a = tmp_path / "a.md"
+    a.write_text("x")
+    _seed_file(store, a, mtime=1.0, size=1, h="hash-original")
+
+    disk = {a: _Stat(mtime=1.0, size=1)}
+
+    # Same hash → unchanged.
+    diff = store.manifest_diff(disk, hash_fn=lambda _p: "hash-original")
+    assert a in diff["unchanged"]
+    assert diff["changed"] == []
+
+    # Different hash → changed (the in-place-edit case).
+    diff = store.manifest_diff(disk, hash_fn=lambda _p: "hash-different")
+    assert diff["unchanged"] == []
+    assert any(p == a for p, _ in diff["changed"])
+
+
+def test_manifest_diff_hash_fn_skipped_when_stat_already_differs(tmp_data_dir, tmp_path):
+    """The hash callback must not run for files whose (mtime, size) already
+    differ — the diff has enough signal to mark them changed without I/O."""
+    store = Store()
+    a = tmp_path / "a.md"
+    a.write_text("x")
+    _seed_file(store, a, mtime=1.0, size=1, h="hash-original")
+
+    calls: list[Path] = []
+
+    def hash_fn(p: Path) -> str:
+        calls.append(p)
+        return "anything"
+
+    disk = {a: _Stat(mtime=99.0, size=99)}
+    store.manifest_diff(disk, hash_fn=hash_fn)
+    assert calls == []
+
+
 def test_cascade_delete_kills_parents_and_chunks(tmp_data_dir):
     store = Store()
     file_ids = store.bulk_insert_files([("/x.md", 0.0, 0, "h", "md", 0.0)])
@@ -73,11 +112,34 @@ def test_save_and_load_embeddings_atomic(tmp_data_dir):
     store = Store()
     arr = np.arange(12, dtype=np.float32).reshape(3, 4)
     store.save_embeddings(store.npz_path, arr, [10, 20, 30])
-    loaded, ids = store.load_embeddings(store.npz_path)
+    loaded = store.load_embeddings(store.npz_path)
     assert np.array_equal(loaded, arr)
-    assert ids == [10, 20, 30]
     # the .tmp must be cleaned up after a successful write
     assert not store.npz_path.with_suffix(store.npz_path.suffix + ".tmp").exists()
+
+
+def test_load_embeddings_ignores_legacy_chunk_ids_array(tmp_data_dir):
+    """`.npz` files written by older versions still carried `chunk_ids`.
+    The new loader silently ignores that key and reads only `embeddings`."""
+    store = Store()
+    arr = np.arange(8, dtype=np.float32).reshape(2, 4)
+    # Manually write an .npz in the old shape so we don't accidentally drift
+    # the old compatibility surface.
+    np.savez(store.npz_path, embeddings=arr,
+             chunk_ids=np.asarray([99, 100], dtype=np.int64))
+    loaded = store.load_embeddings(store.npz_path)
+    assert np.array_equal(loaded, arr)
+
+
+def test_save_embeddings_accepts_chunk_ids_for_compat(tmp_data_dir):
+    """Old callers passing `chunk_ids=` should still work; the array is
+    intentionally not persisted to the .npz."""
+    store = Store()
+    arr = np.arange(8, dtype=np.float32).reshape(2, 4)
+    store.save_embeddings(store.npz_path, arr, chunk_ids=[1, 2])
+    with np.load(store.npz_path) as data:
+        assert "embeddings" in data.files
+        assert "chunk_ids" not in data.files
 
 
 def test_save_bm25_atomic(tmp_data_dir):
@@ -86,6 +148,85 @@ def test_save_bm25_atomic(tmp_data_dir):
     store.save_bm25(store.bm25_path, obj)
     loaded = store.load_bm25(store.bm25_path)
     assert loaded == obj
+
+
+def test_save_artifacts_writes_both_atomically(tmp_data_dir):
+    """The combined writer must leave both files in place and clean up tmps."""
+    store = Store()
+    arr = np.arange(12, dtype=np.float32).reshape(3, 4)
+    bm = {"k": [1, 2, 3]}
+    store.save_artifacts(store.npz_path, arr, store.bm25_path, bm)
+    assert np.array_equal(store.load_embeddings(store.npz_path), arr)
+    assert store.load_bm25(store.bm25_path) == bm
+    for p in (store.npz_path, store.bm25_path):
+        assert not p.with_suffix(p.suffix + ".tmp").exists()
+
+
+def test_save_artifacts_rolls_forward_neither_on_bm25_failure(
+    tmp_data_dir, monkeypatch
+):
+    """If staging the bm25 .tmp fails, neither file is rolled forward —
+    consistency over half-rolled-forward state."""
+    store = Store()
+    # write a known-good baseline to assert nothing changed
+    baseline_arr = np.zeros((1, 1), dtype=np.float32)
+    baseline_bm = {"baseline": True}
+    store.save_artifacts(store.npz_path, baseline_arr, store.bm25_path, baseline_bm)
+
+    # now make pickle.dump blow up; the .npz.tmp will be staged but not
+    # promoted, and the .pkl.tmp write itself errors.
+    import advanced_rag.storage as storage_mod
+
+    def boom(_obj, _fh):
+        raise RuntimeError("synthetic pickle failure")
+
+    monkeypatch.setattr(storage_mod.pickle, "dump", boom)
+
+    new_arr = np.ones((2, 2), dtype=np.float32)
+    new_bm = {"new": True}
+    with pytest.raises(RuntimeError, match="synthetic"):
+        store.save_artifacts(store.npz_path, new_arr, store.bm25_path, new_bm)
+
+    # both files retain their baseline contents
+    assert np.array_equal(store.load_embeddings(store.npz_path), baseline_arr)
+    assert store.load_bm25(store.bm25_path) == baseline_bm
+    # tmp files cleaned up
+    for p in (store.npz_path, store.bm25_path):
+        assert not p.with_suffix(p.suffix + ".tmp").exists()
+
+
+def test_parent_ids_for_chunks_batched(tmp_data_dir):
+    store = Store()
+    fid = store.bulk_insert_files([("/x.md", 0.0, 0, "h", "md", 0.0)])["/x.md"]
+    p1, p2 = store.bulk_insert_parents([
+        (fid, 0, "section", "T1", None, "x", 1),
+        (fid, 1, "section", "T2", None, "y", 1),
+    ])
+    cid_a, cid_b, cid_c = store.bulk_insert_chunks([
+        (p1, 0, "a", 0), (p1, 1, "b", 0), (p2, 0, "c", 0),
+    ])
+    out = store.parent_ids_for_chunks([cid_a, cid_b, cid_c, 999_999])
+    assert out == {cid_a: p1, cid_b: p1, cid_c: p2}
+    # missing id is silently dropped, not raised
+    assert 999_999 not in out
+    # empty input returns empty dict, no SQL roundtrip
+    assert store.parent_ids_for_chunks([]) == {}
+
+
+def test_get_parents_batched(tmp_data_dir):
+    store = Store()
+    fid = store.bulk_insert_files([("/x.md", 0.0, 0, "h", "md", 0.0)])["/x.md"]
+    p1, p2 = store.bulk_insert_parents([
+        (fid, 0, "section", "T1", None, "x-body", 6),
+        (fid, 1, "section", "T2", None, "y-body", 6),
+    ])
+    rows = store.get_parents([p1, p2, 999_999])
+    assert set(rows.keys()) == {p1, p2}
+    assert rows[p1]["title"] == "T1"
+    assert rows[p2]["title"] == "T2"
+    # source_path / filetype are joined in
+    assert rows[p1]["source_path"] == "/x.md"
+    assert rows[p1]["filetype"] == "md"
 
 
 def test_iter_chunks_ordered_canonical_order(tmp_data_dir):

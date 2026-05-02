@@ -63,3 +63,21 @@ def test_identity_fallback_when_everything_breaks(monkeypatch):
 
 def test_empty_input_returns_empty(mock_cohere):
     assert rerank("query", [], top_k=5) == []
+
+
+def test_falls_through_when_cohere_returns_empty(mock_cohere, mock_cross_encoder):
+    """A Cohere call that succeeds but returns zero results must still
+    trigger the local fallback — otherwise the user sees an empty answer
+    despite having parents to rank."""
+    # Force Cohere to return empty results (override the mock)
+    import types
+    mock_cohere._scores = []
+    mock_cohere.Client = lambda *a, **kw: types.SimpleNamespace(
+        rerank=lambda **kw: types.SimpleNamespace(results=[]),
+    )
+    mock_cohere.ClientV2 = mock_cohere.Client
+    mock_cross_encoder._scores = [0.5, 5.0, 1.0]  # B should rank first locally
+
+    out = rerank("query", _parents(), top_k=2)
+    assert [p.parent_id for p in out] == [2, 3]
+    assert out[0].rerank_score == 5.0

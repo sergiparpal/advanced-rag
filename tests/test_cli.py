@@ -101,3 +101,51 @@ def test_handle_index_returns_two_on_failure(tmp_data_dir, monkeypatch, capsys):
     args = argparse.Namespace(rag_cmd="index", path="/tmp/whatever", force=False)
     code = cli.handle_rag(args)
     assert code == 2
+
+
+def test_clear_refuses_root_path(monkeypatch, capsys):
+    """`hermes rag clear --yes` must refuse system roots."""
+    monkeypatch.setenv("HERMES_RAG_DATA_DIR", "/")
+    args = argparse.Namespace(rag_cmd="clear", yes=True)
+    code = cli.handle_rag(args)
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "refusing" in err.lower()
+
+
+def test_clear_refuses_home_dir(monkeypatch, capsys):
+    """Refuses $HOME exactly — can't accidentally wipe a user dir."""
+    from pathlib import Path
+    monkeypatch.setenv("HERMES_RAG_DATA_DIR", str(Path.home()))
+    args = argparse.Namespace(rag_cmd="clear", yes=True)
+    code = cli.handle_rag(args)
+    assert code == 2
+
+
+def test_clear_refuses_shallow_path(monkeypatch, capsys):
+    """Refuses paths with fewer than three meaningful segments."""
+    monkeypatch.setenv("HERMES_RAG_DATA_DIR", "/var/foo")
+    args = argparse.Namespace(rag_cmd="clear", yes=True)
+    code = cli.handle_rag(args)
+    assert code == 2
+
+
+def test_clear_allows_safe_path(tmp_data_dir, capsys):
+    """tmp_data_dir is created under pytest's tmp_path which is deeply nested,
+    so it should be allowed."""
+    (tmp_data_dir / "sentinel.txt").write_text("x")
+    args = argparse.Namespace(rag_cmd="clear", yes=True)
+    code = cli.handle_rag(args)
+    assert code == 0
+    assert not (tmp_data_dir / "sentinel.txt").exists()
+
+
+def test_is_safe_clear_target_unit():
+    """Quick unit test on the predicate so future renames don't accidentally
+    weaken the guard."""
+    from pathlib import Path
+    assert not cli._is_safe_clear_target(Path("/"))
+    assert not cli._is_safe_clear_target(Path("/etc"))
+    assert not cli._is_safe_clear_target(Path.home())
+    assert not cli._is_safe_clear_target(Path("/foo/bar"))  # too shallow
+    assert cli._is_safe_clear_target(Path.home() / ".hermes" / "plugins" / "advanced-rag" / "data")

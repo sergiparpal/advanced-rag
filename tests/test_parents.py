@@ -17,6 +17,8 @@ FIXTURES = Path(__file__).parent / "fixtures" / "docs"
 def test_extract_md_splits_on_h2_headings():
     text = (FIXTURES / "alpha.md").read_text()
     out = extract_md(text)
+    # alpha.md's preamble body is well under PREAMBLE_MIN_CHARS, so it is
+    # dropped as boilerplate — only the three `##` sections remain.
     assert len(out) == 3
     assert all(p.kind == "section" for p in out)
     titles = [p.title for p in out]
@@ -24,6 +26,72 @@ def test_extract_md_splits_on_h2_headings():
     assert any("Section two" in t for t in titles)
     assert any("Section three" in t for t in titles)
     assert "cosmic ray" in out[1].text.lower()
+
+
+def test_extract_md_preamble_emits_when_body_long_enough():
+    intro = (
+        "This document is a long-enough TL;DR that absolutely should not be "
+        "silently discarded. " * 5
+    )
+    text = f"# Title\n\n{intro}\n\n## Section A\nbody A\n"
+    out = extract_md(text)
+    assert len(out) == 2
+    pre = out[0]
+    assert pre.kind == "preamble"
+    assert pre.title == "Title"
+    assert "TL;DR" in pre.text
+    # the H1 line itself becomes the title; the body is what follows
+    assert pre.text.startswith("Title\n")
+    assert out[1].kind == "section"
+    assert "Section A" in out[1].title
+
+
+def test_extract_md_preamble_dropped_when_body_too_short():
+    text = "# Title\n\nshort intro.\n\n## Section A\nbody A\n"
+    out = extract_md(text)
+    assert len(out) == 1
+    assert out[0].kind == "section"
+
+
+def test_extract_md_preamble_without_h1_has_no_title():
+    body = "Plain prefix paragraph with substantial content. " * 6
+    text = f"{body}\n\n## Section A\nbody A\n"
+    out = extract_md(text)
+    assert len(out) == 2
+    assert out[0].kind == "preamble"
+    assert out[0].title is None
+    assert "Plain prefix paragraph" in out[0].text
+
+
+def test_extract_md_preamble_threshold_is_overridable():
+    text = "# T\n\nshort body.\n\n## S\nbody\n"
+    # forced low threshold lets the short preamble through
+    out = extract_md(text, preamble_min_chars=5)
+    assert len(out) == 2
+    assert out[0].kind == "preamble"
+    assert out[0].title == "T"
+
+
+def test_extract_md_splits_inside_fenced_code_block_known_limitation():
+    """v0.1 limitation: the line-oriented `##` regex doesn't understand fenced
+    code blocks, so an unindented `##` inside ``` ... ``` is treated as a
+    section break. Pin the current behavior so a future refactor can't change
+    it silently — the user-facing fix lands in v0.2."""
+    text = (
+        "# Title\n\n"
+        "Intro is too short to become a preamble parent.\n\n"
+        "## Real section\n"
+        "Body of the real section.\n\n"
+        "```python\n"
+        "## comment that looks like a heading\n"
+        "print('hello')\n"
+        "```\n"
+    )
+    out = extract_md(text)
+    titles = [p.title for p in out]
+    # Two `##` lines were detected (the real one and the one inside the fence).
+    assert any("Real section" in t for t in titles)
+    assert any("comment that looks like a heading" in t for t in titles)
 
 
 def test_extract_md_falls_back_when_no_h2():

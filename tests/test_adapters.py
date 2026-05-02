@@ -171,16 +171,36 @@ def test_plugin_yaml_parses_and_has_expected_keys():
     assert sorted(hooks) == ["on_session_start", "pre_llm_call"]
 
 
-def test_plugin_yaml_requires_env_is_string_list():
-    """Hermes parser at hermes_cli/plugins.py:892 accepts both strings and
-    dicts, but no codebase consumer reads dict fields. Convention is strings."""
+def test_plugin_yaml_does_not_misrepresent_optional_env_as_required():
+    """All env vars used by the plugin are optional (Cohere, Anthropic, and the
+    data-dir override). They must NOT appear under `requires_env` — that field
+    is reserved for actual hard dependencies and is what `hermes plugin list`
+    surfaces. The optional set lives under our `optional_env` documentation
+    key, which Hermes ignores."""
     p = Path(__file__).parent.parent / "advanced_rag" / "plugin.yaml"
     data = yaml.safe_load(p.read_text())
-    env = data.get("requires_env", [])
-    assert env, "requires_env should not be empty"
-    for item in env:
+    assert not data.get("requires_env"), \
+        "requires_env must be empty/absent — the plugin runs with zero env vars"
+    optional = data.get("optional_env", [])
+    assert "COHERE_API_KEY" in optional
+    assert "ANTHROPIC_API_KEY" in optional
+    assert "HERMES_RAG_DATA_DIR" in optional
+    for item in optional:
         assert isinstance(item, str), \
-            f"requires_env entry should be a string, got {type(item).__name__}: {item!r}"
+            f"optional_env entry should be a string, got {type(item).__name__}: {item!r}"
+
+
+def test_requirements_files_are_in_sync():
+    """`advanced_rag/requirements.txt` is intentionally a copy of the repo-root
+    file (so a single rsync of the inner package carries deps to runtime). If
+    they drift, the deployment would silently install the wrong set."""
+    root = Path(__file__).parent.parent
+    a = (root / "requirements.txt").read_text()
+    b = (root / "advanced_rag" / "requirements.txt").read_text()
+    assert a == b, (
+        "requirements.txt and advanced_rag/requirements.txt have diverged. "
+        "Update one to match the other (or both, to whatever the new spec is)."
+    )
 
 
 def test_skill_md_has_frontmatter():

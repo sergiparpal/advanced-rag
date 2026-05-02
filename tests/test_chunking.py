@@ -37,6 +37,18 @@ def test_overlap_stitches_adjacent_chunks():
     assert len(out) > 1
 
 
+def test_overlap_relaxes_chunk_size_bound_to_max_plus_overlap():
+    """With overlap > 0 the relaxed invariant is `len(c) <= max_size + overlap`,
+    not `<= max_size`. Pin it so a future refactor can't quietly tighten the
+    rule and surprise callers (downstream MAX_PARENT_CHARS=8000 absorbs the
+    slop, but other callers might not)."""
+    paras = ["alpha alpha alpha " * 20, "beta beta beta " * 20, "gamma gamma " * 20]
+    text = "\n\n".join(paras)
+    max_size, overlap = 200, 40
+    out = recursive_split(text, max_size=max_size, overlap=overlap)
+    assert all(len(c) <= max_size + overlap for c in out)
+
+
 def test_nested_separator_fallback():
     text = "first part. second part. third part. " * 30
     out = recursive_split(text, max_size=120, overlap=20)

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .config import EMBED_MODEL
+from .config import EMBED_MODEL, EMBED_MODEL_DIMS
 
 
 class Embedder:
@@ -15,13 +15,30 @@ class Embedder:
         self._model_name = model_name
         self._model = None
 
+    @property
+    def dim(self) -> int | None:
+        """Vector dimension declared in EMBED_MODEL_DIMS, or None for unknown
+        models. Used to shape the empty-input return value without loading the
+        model."""
+        return EMBED_MODEL_DIMS.get(self._model_name)
+
     def encode(self, texts: list[str], batch_size: int = 64) -> np.ndarray:
+        if not texts:
+            # SentenceTransformer raises on an empty list; short-circuit. The
+            # shape uses the declared dim for the configured model so callers
+            # that swap models don't get a silent (0, 384) misfit.
+            dim = self.dim
+            if dim is None:
+                # Unknown model: load it so we can read the real dim. Better
+                # to pay the import cost once than to corrupt downstream shape
+                # checks.
+                from sentence_transformers import SentenceTransformer
+                self._model = self._model or SentenceTransformer(self._model_name)
+                dim = int(self._model.get_sentence_embedding_dimension())
+            return np.zeros((0, dim), dtype=np.float32)
         if self._model is None:
             from sentence_transformers import SentenceTransformer
             self._model = SentenceTransformer(self._model_name)
-        if not texts:
-            # SentenceTransformer raises on an empty list; short-circuit.
-            return np.zeros((0, 384), dtype=np.float32)
         vecs = self._model.encode(
             list(texts),
             batch_size=batch_size,

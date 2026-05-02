@@ -17,6 +17,31 @@ from .storage import Store
 
 log = logging.getLogger(__name__)
 
+# `hermes rag clear --yes` skips the confirmation prompt, so we must refuse
+# obviously-dangerous targets (e.g. a misconfigured HERMES_RAG_DATA_DIR=/).
+_FORBIDDEN_CLEAR_TARGETS = {
+    Path("/"), Path("/etc"), Path("/usr"), Path("/bin"), Path("/sbin"),
+    Path("/var"), Path("/boot"), Path("/lib"), Path("/lib64"), Path("/sys"),
+    Path("/proc"), Path("/dev"), Path("/root"), Path("/home"), Path("/opt"),
+    Path("/srv"), Path("/tmp"), Path("/run"), Path("/mnt"), Path("/media"),
+    Path.home(),
+}
+
+
+def _is_safe_clear_target(data_dir: Path) -> bool:
+    """Refuse rmtree on system roots, $HOME, or any path so short it's
+    suspicious. The cheap-and-strict check that catches misconfigured envs."""
+    try:
+        resolved = data_dir.resolve()
+    except (OSError, RuntimeError):
+        return False
+    if resolved in _FORBIDDEN_CLEAR_TARGETS:
+        return False
+    parts = [p for p in resolved.parts if p not in ("/", "")]
+    # A trustworthy data dir has at least three meaningful segments
+    # (e.g. /home/<user>/.hermes/...) — refuse anything shallower.
+    return len(parts) >= 3
+
 
 def setup_rag_parser(parser: argparse.ArgumentParser) -> None:
     sub = parser.add_subparsers(dest="rag_cmd", required=True)
@@ -45,6 +70,14 @@ def handle_rag(args: argparse.Namespace, *, _indexer=indexing,
             return 0
         if cmd == "clear":
             data_dir = get_data_dir()
+            if not _is_safe_clear_target(data_dir):
+                print(
+                    f"refusing to remove {data_dir!s}: looks like a system or "
+                    "shallow path. Set HERMES_RAG_DATA_DIR to something under "
+                    "your home directory.",
+                    file=sys.stderr,
+                )
+                return 2
             if not bool(getattr(args, "yes", False)):
                 resp = _input(f"Delete RAG data at {data_dir}? [y/N] ").strip().lower()
                 if resp not in ("y", "yes"):

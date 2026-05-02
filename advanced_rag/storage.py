@@ -11,7 +11,7 @@ import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 import numpy as np
 
@@ -120,17 +120,29 @@ class Store:
 
     # --- manifest diff ---
 
-    def manifest_diff(self, disk_files: dict[Path, os.stat_result]) -> dict:
+    def manifest_diff(
+        self,
+        disk_files: dict[Path, os.stat_result],
+        hash_fn: Callable[[Path], str] | None = None,
+    ) -> dict:
         """Returns {unchanged, changed, new, deleted}, each a list/dict by path.
 
-        - unchanged: same mtime AND size as the row in `files`.
-        - changed: row exists but mtime or size differ.
+        - unchanged: same mtime AND size (and same content_hash, when
+          ``hash_fn`` is supplied) as the row in `files`.
+        - changed: row exists but mtime, size, or (when checked) content_hash
+          differ.
         - new: path not in `files` table.
         - deleted: row exists but path not in `disk_files`.
+
+        ``hash_fn`` is only invoked on the (mtime, size)-match branch, so
+        unchanged files dominate the cost: each pays exactly one hash. Files
+        with stale (mtime, size) shortcut to "changed" without re-hashing —
+        the hash will be recomputed when the file is reindexed anyway.
         """
         conn = self.connect()
-        rows = {Path(r["path"]): {"id": r["id"], "mtime": r["mtime"], "size": r["size"]}
-                for r in conn.execute("SELECT id, path, mtime, size FROM files")}
+        rows = {Path(r["path"]): {"id": r["id"], "mtime": r["mtime"],
+                                  "size": r["size"], "content_hash": r["content_hash"]}
+                for r in conn.execute("SELECT id, path, mtime, size, content_hash FROM files")}
 
         unchanged: list[Path] = []
         changed: list[tuple[Path, int]] = []  # (path, file_id)
@@ -142,7 +154,16 @@ class Store:
             if row is None:
                 new.append(path)
             elif row["mtime"] == st.st_mtime and row["size"] == st.st_size:
-                unchanged.append(path)
+                if hash_fn is None:
+                    unchanged.append(path)
+                else:
+                    disk_hash = hash_fn(path)
+                    if disk_hash == row["content_hash"]:
+                        unchanged.append(path)
+                    else:
+                        # in-place edit that preserved (mtime, size) — rare but
+                        # real (e.g. `os.utime` after a same-size rewrite).
+                        changed.append((path, row["id"]))
             else:
                 changed.append((path, row["id"]))
 
@@ -262,6 +283,48 @@ class Store:
                          (chunk_id,)).fetchone()
         return r["parent_id"] if r else None
 
+    def parent_ids_for_chunks(self, chunk_ids: Iterator[int] | list[int]) -> dict[int, int]:
+        """Batched chunk_id → parent_id lookup. Skips ids that don't exist."""
+        ids = list(chunk_ids)
+        if not ids:
+            return {}
+        conn = self.connect()
+        out: dict[int, int] = {}
+        # SQLite has a fixed parameter ceiling (default 999); chunk in case the
+        # caller hands us a very large list.
+        for start in range(0, len(ids), 500):
+            batch = ids[start:start + 500]
+            qmarks = ",".join("?" * len(batch))
+            rows = conn.execute(
+                f"SELECT id, parent_id FROM chunks WHERE id IN ({qmarks})", batch,
+            ).fetchall()
+            for r in rows:
+                out[r["id"]] = r["parent_id"]
+        return out
+
+    def get_parents(self, parent_ids: Iterator[int] | list[int]) -> dict[int, dict]:
+        """Batched parent fetch. Returns {parent_id: row dict}, skipping
+        missing ids. Joins `files` so the source_path/filetype are populated."""
+        ids = list(parent_ids)
+        if not ids:
+            return {}
+        conn = self.connect()
+        out: dict[int, dict] = {}
+        for start in range(0, len(ids), 500):
+            batch = ids[start:start + 500]
+            qmarks = ",".join("?" * len(batch))
+            rows = conn.execute(
+                "SELECT p.id, p.file_id, p.ord, p.kind, p.title, p.page_no, "
+                "       p.text, p.char_len, "
+                "       f.path AS source_path, f.filetype "
+                f"FROM parents p JOIN files f ON f.id = p.file_id "
+                f"WHERE p.id IN ({qmarks})",
+                batch,
+            ).fetchall()
+            for r in rows:
+                out[r["id"]] = dict(r)
+        return out
+
     def list_sources(self) -> list[dict]:
         conn = self.connect()
         rows = conn.execute(
@@ -287,7 +350,13 @@ class Store:
     # --- atomic embeddings + bm25 IO ---
 
     def save_embeddings(self, target_path: Path, embeddings: np.ndarray,
-                        chunk_ids: list[int]) -> None:
+                        chunk_ids: list[int] | None = None) -> None:
+        """Write the embeddings array atomically. `chunk_ids` is accepted for
+        backwards compatibility but no longer persisted — the canonical
+        row-index ↔ chunk-id mapping lives in SQLite (`chunks.embed_row`),
+        and the engine reconstructs the list from `iter_chunks_ordered()`.
+        """
+        del chunk_ids  # dropped from .npz on purpose; kept in the signature
         target = Path(target_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_suffix(target.suffix + ".tmp")
@@ -295,8 +364,7 @@ class Store:
         # atomic-rename scheme.
         try:
             with open(tmp, "wb") as fh:
-                np.savez(fh, embeddings=embeddings,
-                         chunk_ids=np.asarray(chunk_ids, dtype=np.int64))
+                np.savez(fh, embeddings=embeddings)
             os.replace(tmp, target)
         finally:
             if tmp.exists():
@@ -305,11 +373,11 @@ class Store:
                 except OSError:
                     pass
 
-    def load_embeddings(self, target_path: Path) -> tuple[np.ndarray, list[int]]:
+    def load_embeddings(self, target_path: Path) -> np.ndarray:
+        """Return the embeddings array. Old `.npz` files that still carry a
+        `chunk_ids` array load fine — we just ignore that key."""
         with np.load(target_path) as data:
-            embeddings = data["embeddings"]
-            chunk_ids = data["chunk_ids"].tolist()
-        return embeddings, chunk_ids
+            return data["embeddings"]
 
     def save_bm25(self, target_path: Path, bm25_obj) -> None:
         target = Path(target_path)
@@ -329,3 +397,42 @@ class Store:
     def load_bm25(self, target_path: Path):
         with open(target_path, "rb") as f:
             return pickle.load(f)
+
+    def save_artifacts(
+        self,
+        npz_target: Path,
+        embeddings: np.ndarray,
+        bm25_target: Path,
+        bm25_obj,
+    ) -> None:
+        """Write embeddings.npz and bm25.pkl with a tightened atomicity window.
+
+        Both ``.tmp`` files are staged in full first; only after both writes
+        succeed do we run ``os.replace`` on each, back to back. The desync
+        window between "embeddings rolled forward" and "bm25 rolled forward"
+        shrinks from "the time of one full pickle dump" to the time between
+        two ``os.replace`` calls (microseconds). The engine's load-time
+        consistency check still has to cover the residual case.
+        """
+        npz_target = Path(npz_target)
+        bm25_target = Path(bm25_target)
+        npz_target.parent.mkdir(parents=True, exist_ok=True)
+        bm25_target.parent.mkdir(parents=True, exist_ok=True)
+
+        npz_tmp = npz_target.with_suffix(npz_target.suffix + ".tmp")
+        bm25_tmp = bm25_target.with_suffix(bm25_target.suffix + ".tmp")
+
+        try:
+            with open(npz_tmp, "wb") as fh:
+                np.savez(fh, embeddings=embeddings)
+            with open(bm25_tmp, "wb") as fh:
+                pickle.dump(bm25_obj, fh)
+            os.replace(npz_tmp, npz_target)
+            os.replace(bm25_tmp, bm25_target)
+        finally:
+            for tmp in (npz_tmp, bm25_tmp):
+                if tmp.exists():
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass

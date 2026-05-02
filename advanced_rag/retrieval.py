@@ -96,9 +96,11 @@ def hybrid_search(engine, query: str, k_pool: int = 30) -> list[Hit]:
     if not fused:
         return []
     top = sorted(fused.items(), key=lambda kv: -kv[1])[:k_pool]
+    # One SQL roundtrip for the whole batch instead of N+1 per-chunk lookups.
+    parent_by_chunk = engine._store.parent_ids_for_chunks([cid for cid, _ in top])
     out: list[Hit] = []
     for cid, score in top:
-        pid = engine._store.parent_id_for_chunk(cid)
+        pid = parent_by_chunk.get(cid)
         if pid is None:
             continue
         out.append(Hit(chunk_id=cid, score=score, parent_id=pid))
@@ -116,9 +118,11 @@ def chunks_to_parents(engine, hits: Iterable[Hit], top: int) -> list[ParentResul
             by_parent[h.parent_id] = h.score
 
     ranked = sorted(by_parent.items(), key=lambda kv: -kv[1])[:top]
+    # Single batched fetch for all top parent rows.
+    parent_rows = engine._store.get_parents([pid for pid, _ in ranked])
     out: list[ParentResult] = []
     for pid, score in ranked:
-        row = engine._store.get_parent(pid)
+        row = parent_rows.get(pid)
         if row is None:
             continue
         out.append(ParentResult(

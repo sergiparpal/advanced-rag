@@ -33,8 +33,44 @@ def _strip_fences(text: str) -> str:
     return m.group(1).strip() if m else text.strip()
 
 
+# Module-level Anthropic client cache. Reusing a single client across calls
+# keeps the underlying httpx connection pool warm and lets the SDK's
+# prompt-caching layer share state — both noticeably improve cache-hit rate
+# and remove a few ms of per-call setup. The client is lazy because the
+# `anthropic` package is an optional dep and may not be installed.
+_ANTHROPIC_CLIENT = None
+
+
+def _get_anthropic_client():
+    """Return a cached `anthropic.Anthropic` client, or None if the SDK is not
+    installed. Importing inside the function keeps the optional dependency
+    truly optional."""
+    global _ANTHROPIC_CLIENT
+    if _ANTHROPIC_CLIENT is not None:
+        return _ANTHROPIC_CLIENT
+    try:
+        import anthropic
+    except ImportError:
+        return None
+    _ANTHROPIC_CLIENT = anthropic.Anthropic()
+    return _ANTHROPIC_CLIENT
+
+
+def _reset_anthropic_client_for_tests() -> None:
+    """Test helper. Forces the next `expand_query` call to re-import and
+    re-create the client — needed because `mock_anthropic` swaps `sys.modules`
+    per test."""
+    global _ANTHROPIC_CLIENT
+    _ANTHROPIC_CLIENT = None
+
+
 def expand_query(q: str) -> list[str]:
     """Return [q] (fallback) or [q, p1, p2, p3, hyde] when expansion succeeds.
+
+    Paraphrases are deduplicated against the original query AND against each
+    other (case- and whitespace-insensitive), so a model that returns
+    ``["foo", "FOO", "bar"]`` does not waste a hybrid_search round on the
+    duplicate.
 
     Failure modes that fall back silently to [q]:
       - `import anthropic` fails (package not installed)
@@ -46,13 +82,11 @@ def expand_query(q: str) -> list[str]:
         return [q] if q else []
     if not os.environ.get("ANTHROPIC_API_KEY"):
         return [q]
-    try:
-        import anthropic
-    except ImportError:
+    client = _get_anthropic_client()
+    if client is None:
         return [q]
 
     try:
-        client = anthropic.Anthropic()
         msg = client.messages.create(
             model=ANTHROPIC_MODEL,
             max_tokens=512,
@@ -63,9 +97,25 @@ def expand_query(q: str) -> list[str]:
         paraphrases = payload.get("paraphrases", []) or []
         hyde = payload.get("hyde", "") or ""
         out = [q]
-        for p in paraphrases[:3]:
-            if isinstance(p, str) and p.strip() and p.strip() != q.strip():
-                out.append(p.strip())
+        # Dedupe FIRST (canonical = stripped + lowercased), THEN cap at 3 — so
+        # a model that returns ["foo", "foo", "bar", "baz"] still contributes
+        # three useful paraphrases instead of being undermined by duplicates.
+        seen = {q.strip().lower()}
+        kept = 0
+        for p in paraphrases:
+            if kept >= 3:
+                break
+            if not isinstance(p, str):
+                continue
+            stripped = p.strip()
+            if not stripped:
+                continue
+            key = stripped.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(stripped)
+            kept += 1
         if isinstance(hyde, str) and hyde.strip():
             out.append(hyde.strip())
         return out or [q]

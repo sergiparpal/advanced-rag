@@ -66,13 +66,23 @@ def _try_local_cross_encoder(query: str, parents: list[ParentResult], top_k: int
 
 
 def rerank(query: str, parents: list[ParentResult], top_k: int) -> list[ParentResult]:
+    """Rerank `parents` by relevance to `query` and return the top `top_k`.
+
+    **Mutates input.** The chosen reranker writes its score back onto each
+    returned ``ParentResult`` via ``p.rerank_score = ...``. Callers that need
+    to rerank the same list more than once (e.g. A/B testing models) should
+    pass copies; otherwise a stale ``rerank_score`` from the previous call
+    will leak into the next.
+    """
     if not parents:
         return []
     cohere_out = _try_cohere(query, parents, top_k)
-    if cohere_out is not None:
+    # Truthy check (not `is not None`): an empty Cohere result must fall
+    # through to the local reranker rather than hand the user back nothing.
+    if cohere_out:
         return cohere_out
     local_out = _try_local_cross_encoder(query, parents, top_k)
-    if local_out is not None:
+    if local_out:
         return local_out
     # identity fallback
     return parents[:top_k]

@@ -6,6 +6,10 @@ stays untouched. All shapes below are verified against the Hermes source.
 """
 from __future__ import annotations
 
+import logging
+
+log = logging.getLogger(__name__)
+
 
 def make_cli_setup():
     def _setup(parser):
@@ -73,9 +77,12 @@ def make_session_warm_hook():
             try:
                 from .engine import get_engine
                 get_engine()._ensure_loaded()
-            except Exception:
+            except Exception as e:
                 # Cold load on first ambient call is the fallback. Never raise.
-                pass
+                # Logged at DEBUG so users who opt in (e.g. by enabling debug
+                # logging for advanced_rag) can spot warm failures; default
+                # level keeps the swallow silent.
+                log.debug("session warm-up failed (cold load will retry): %s", e)
 
         threading.Thread(target=_bg, daemon=True).start()
     return _warm

@@ -371,6 +371,7 @@ Parent kinds:
 - Recurse on remaining separator list when a single part overflows.
 - Fall through to fixed-size hard split with overlap when no separator works.
 - Edge cases: whitespace-only → `[]`; text shorter than `max_size` → `[text]`; word longer than `max_size` → hard-split fallback.
+- **Effective chunk-size bound is `max_size + overlap`**, not `max_size` alone: the overlap pass (when `overlap > 0` and `len(chunks) > 1`) prepends the previous chunk's tail before the current chunk and accepts the merged result up to `max_size + overlap` chars. Downstream consumers must size their buffers against `max_size + overlap`. The parent cap (`MAX_PARENT_CHARS = 8000`) absorbs the slop comfortably.
 
 ### 3.9 Storage requirements
 
