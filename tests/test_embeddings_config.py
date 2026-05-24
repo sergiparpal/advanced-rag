@@ -103,6 +103,31 @@ def test_empty_input_uses_resolved_dim(monkeypatch):
     assert out.shape == (0, 1024)
 
 
+def test_encode_empty_raises_when_dim_cannot_be_resolved(monkeypatch):
+    """If a model fails to expose its dim (returns None / 0) and the user
+    didn't pin HERMES_RAG_EMBED_DIM, encode([]) must raise rather than
+    silently hand back a (0, 0) array that breaks downstream dense search."""
+    fake_st = types.ModuleType("sentence_transformers")
+
+    class _NoDim:
+        def __init__(self, _name):
+            pass
+
+        def get_sentence_embedding_dimension(self):
+            return None
+
+        def encode(self, texts, **kw):
+            return np.zeros((len(texts), 0), dtype=np.float32)
+
+    fake_st.SentenceTransformer = _NoDim
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_st)
+    monkeypatch.delenv("HERMES_RAG_EMBED_DIM", raising=False)
+
+    e = Embedder(model_name="mystery-model")
+    with pytest.raises(RuntimeError, match="could not determine embedding dim"):
+        e.encode([])
+
+
 # --- meta row written at index time ---
 
 def test_indexing_writes_embed_model_meta(tmp_data_dir, tmp_path, stub_embedder):

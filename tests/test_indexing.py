@@ -127,6 +127,52 @@ def test_engine_chunk_ids_match_canonical_order(tmp_data_dir, tmp_path, stub_emb
     assert eng._embeddings.shape[0] == len(canonical)
 
 
+def test_index_with_explicit_store_does_not_reset_singleton(
+    tmp_data_dir, tmp_path, stub_embedder, monkeypatch,
+):
+    """When the caller supplies an explicit store=, the process-wide engine
+    singleton is bound to a different data_dir; resetting it would force
+    an unrelated cold reload on the next ambient call."""
+    from advanced_rag import engine as engine_mod
+
+    reset_called = {"n": 0}
+
+    class _Spy:
+        def reset(self):
+            reset_called["n"] += 1
+
+    monkeypatch.setattr(engine_mod, "get_engine", lambda: _Spy())
+
+    docs = _stage(tmp_path)
+    store = Store()
+    index_path(docs, store=store, embedder=stub_embedder)
+    assert reset_called["n"] == 0
+
+
+def test_index_without_explicit_store_resets_singleton(
+    tmp_data_dir, tmp_path, stub_embedder, monkeypatch,
+):
+    """When the caller omits store=, index_path owns the Store and is
+    expected to flush the singleton's cached artifacts."""
+    from advanced_rag import engine as engine_mod
+    # Make sure index_path won't actually try to load a real Embedder.
+    import advanced_rag.indexing as indexing_mod
+    monkeypatch.setattr(indexing_mod, "rebuild_artifacts", lambda *a, **kw: None)
+
+    reset_called = {"n": 0}
+
+    class _Spy:
+        def reset(self):
+            reset_called["n"] += 1
+
+    monkeypatch.setattr(engine_mod, "get_engine", lambda: _Spy())
+
+    docs = _stage(tmp_path)
+    # Bypass Embedder construction by passing stub explicitly.
+    index_path(docs, embedder=stub_embedder)
+    assert reset_called["n"] == 1
+
+
 def test_indexing_failure_warning_goes_to_stderr(
     tmp_data_dir, tmp_path, stub_embedder, monkeypatch, capsys
 ):

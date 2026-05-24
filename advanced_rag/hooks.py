@@ -34,13 +34,17 @@ def ambient_pre_llm_call(
     session_id: str | None = None,
     user_message: str = "",
     conversation_history=None,
-    is_first_turn: bool = False,
     model: str | None = None,
     platform: str | None = None,
     **kwargs,
 ):
     """Return `{"context": str}` to inject ambient context, or `None` to do
-    nothing. Never raises."""
+    nothing. Never raises.
+
+    Hermes passes additional kwargs that this hook doesn't use today
+    (`is_first_turn`, `sender_id`, etc.); they're absorbed by ``**kwargs`` so
+    upstream signature drift never breaks the wire.
+    """
     try:
         if not state.is_ambient_enabled(session_id):
             return None
@@ -68,13 +72,13 @@ def ambient_pre_llm_call(
         if not parents:
             return None
 
-        # Threshold now applies to the post-rerank score. Identity fallback
-        # (cross-encoder absent) preserves the RRF score on `score`; the
-        # check below tolerates either.
-        top_score = parents[0].rerank_score
-        if top_score is None:
-            top_score = parents[0].score
-        if top_score < AMBIENT_SCORE_THRESHOLD:
+        # Threshold applies to the post-rerank score. Identity fallback (no
+        # cross-encoder) keeps `rerank_score=None`, so `effective_score`
+        # falls back to RRF. Note: RRF scores are tiny (~0.03-0.06), so a
+        # 0.25 threshold effectively gates ambient OFF when the cross-encoder
+        # is unavailable. That's intentional — without a reranker we don't
+        # have enough confidence to inject silently.
+        if parents[0].effective_score < AMBIENT_SCORE_THRESHOLD:
             return None
 
         context = retrieval.format_context(parents, token_cap=AMBIENT_TOKEN_CAP)

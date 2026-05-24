@@ -7,8 +7,36 @@ stays untouched. All shapes below are verified against the Hermes source.
 from __future__ import annotations
 
 import logging
+import threading
 
 log = logging.getLogger(__name__)
+
+
+def _safe(label: str, fn):
+    """Call ``fn()`` and swallow any exception with a debug log.
+
+    Used by the warm-up hook where we want best-effort preloading and never a
+    raise that could disturb session start.
+    """
+    try:
+        fn()
+    except Exception as e:
+        log.debug("%s failed: %s", label, e)
+
+
+# `on_session_start` fires per new session. Warming is idempotent at the engine
+# and reranker layers, but we still gate it with a one-shot flag so a
+# long-running Hermes process doesn't spawn one thread per session.
+_WARM_LAUNCHED = False
+_WARM_LOCK = threading.Lock()
+
+
+def _reset_warm_for_tests() -> None:
+    """Test helper. Clears the one-shot warm flag so successive tests can
+    re-trigger the warm-up path."""
+    global _WARM_LAUNCHED
+    with _WARM_LOCK:
+        _WARM_LAUNCHED = False
 
 
 def make_cli_setup():
@@ -47,17 +75,17 @@ def make_hook_wrapper():
 
     Hermes calls hooks as cb(**kwargs). Real kwargs (run_agent.py:10619):
     session_id, user_message, conversation_history, is_first_turn, model,
-    platform, sender_id. The legacy variant (still in use by some plugins)
-    passes a different set; keyword-only with defaults handles both.
+    platform, sender_id. The pure hook only consumes a subset; the rest
+    flow through ``**kwargs`` so signature drift in Hermes doesn't break
+    the wire.
     """
     def _hook(*, session_id="", user_message="", conversation_history=None,
-              is_first_turn=False, model="", platform="", **kwargs):
+              model="", platform="", **kwargs):
         from .hooks import ambient_pre_llm_call
         return ambient_pre_llm_call(
             session_id=session_id,
             user_message=user_message,
             conversation_history=conversation_history or [],
-            is_first_turn=is_first_turn,
             model=model,
             platform=platform,
             **kwargs,
@@ -67,28 +95,26 @@ def make_hook_wrapper():
 
 def make_session_warm_hook():
     """Warm the engine + ambient reranker on new sessions. Background thread
-    — never blocks session_start. Hermes fires this only on brand-new
-    sessions (run_agent.py:10519), so the cost is paid once per session.
+    — never blocks session_start. Hermes fires this for every brand-new
+    session (run_agent.py:10519); we gate with a one-shot flag so a
+    long-running process spawns the warm thread at most once.
 
     Phase 3: the ambient path reranks every turn with the local
     cross-encoder; preload that here too so the first per-turn rerank
     doesn't pay the model-download / model-load cost.
     """
     def _warm(*, session_id="", model="", platform="", **_):
-        import threading
+        global _WARM_LAUNCHED
+        with _WARM_LOCK:
+            if _WARM_LAUNCHED:
+                return
+            _WARM_LAUNCHED = True
 
         def _bg():
-            try:
-                from .engine import get_engine
-                get_engine()._ensure_loaded()
-            except Exception as e:
-                # Cold load on first ambient call is the fallback. Never raise.
-                log.debug("session warm-up failed (cold load will retry): %s", e)
-            try:
-                from .rerank import warm_local_cross_encoder
-                warm_local_cross_encoder()
-            except Exception as e:
-                log.debug("cross-encoder warm-up failed: %s", e)
+            from .engine import get_engine
+            from .rerank import warm_local_cross_encoder
+            _safe("session warm-up", lambda: get_engine()._ensure_loaded())
+            _safe("cross-encoder warm-up", warm_local_cross_encoder)
 
         threading.Thread(target=_bg, daemon=True).start()
     return _warm

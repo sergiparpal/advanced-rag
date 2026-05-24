@@ -2,15 +2,20 @@
 string — never raises out to the caller."""
 from __future__ import annotations
 
+import heapq
 import json
+from typing import TYPE_CHECKING
 
 from . import crag, expansion, rerank, retrieval
 from .engine import get_engine
 from .retrieval import Hit
 from .storage import Store
 
+if TYPE_CHECKING:
+    from .engine import RAGEngine
 
-def _resolve(store=None, engine=None) -> tuple[Store, object]:
+
+def _resolve(store=None, engine=None) -> tuple[Store, "RAGEngine"]:
     eng = engine if engine is not None else get_engine()
     eng._ensure_loaded()
     st = store if store is not None else eng.store
@@ -37,13 +42,15 @@ def _run_search_pipeline(store: Store, eng, query: str, k: int):
     if not fused:
         return [], len(variants)
 
-    top_chunks = sorted(fused.items(), key=lambda kv: -kv[1])[:30]
-    materialized: list[Hit] = []
-    for cid, score in top_chunks:
-        pid = store.parent_id_for_chunk(cid)
-        if pid is None:
-            continue
-        materialized.append(Hit(chunk_id=cid, score=float(score), parent_id=pid))
+    # Pick the top-30 chunks with a partial sort, then batch the parent_id
+    # lookup. The old code did 30 individual SQL roundtrips here.
+    top_chunks = heapq.nlargest(30, fused.items(), key=lambda kv: kv[1])
+    parent_by_chunk = store.parent_ids_for_chunks([cid for cid, _ in top_chunks])
+    materialized: list[Hit] = [
+        Hit(chunk_id=cid, score=float(score), parent_id=pid)
+        for cid, score in top_chunks
+        if (pid := parent_by_chunk.get(cid)) is not None
+    ]
 
     parents = retrieval.chunks_to_parents(eng, materialized, top=10)
     reranked = rerank.rerank(query, parents, top_k=k)

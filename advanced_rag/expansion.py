@@ -116,8 +116,13 @@ def expand_query(q: str) -> list[str]:
             seen.add(key)
             out.append(stripped)
             kept += 1
+        # Dedupe HyDE against the original query and the surviving paraphrases
+        # too — otherwise a model that echoes the query into the `hyde` field
+        # wastes a hybrid_search variant on an exact duplicate.
         if isinstance(hyde, str) and hyde.strip():
-            out.append(hyde.strip())
+            stripped = hyde.strip()
+            if stripped.lower() not in seen:
+                out.append(stripped)
         return out or [q]
     except Exception as e:
         log.warning("query expansion failed: %s", e)

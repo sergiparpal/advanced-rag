@@ -82,15 +82,18 @@ def get_embed_dim() -> int | None:
         return None
 
 
-# Legacy alias kept so existing imports of `EMBED_MODEL` keep working. The
-# canonical accessor is now `get_embed_model()`.
-EMBED_MODEL = DEFAULT_EMBED_MODEL
 RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 COHERE_RERANK_MODEL = "rerank-english-v3.0"
 
 # Contextual Retrieval (Phase 2) — opt-in via HERMES_RAG_CONTEXTUAL=1.
 CONTEXTUAL_MAX_TOKENS = 150  # output cap for the prefix-generation LLM call
+# Per-parent thread pool for contextual prefix generation. Anthropic's prompt
+# cache is parent-scoped, so concurrent requests for chunks of the SAME parent
+# all hit the same cache entry — concurrency multiplies throughput without
+# multiplying token cost. Conservative default keeps tier-1 API users under
+# the rate limit; bump for tier 3+.
+CONTEXTUAL_CONCURRENCY = 4
 
 # CRAG-lite (Phase 4) — opt-in via HERMES_RAG_CRAG=1.
 

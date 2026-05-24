@@ -65,6 +65,23 @@ def test_empty_input_returns_empty(mock_cohere):
     assert rerank("query", [], top_k=5) == []
 
 
+def test_cohere_response_with_negative_idx_is_skipped(mock_cohere):
+    """A malformed Cohere response carrying idx=-1 must not silently rank a
+    wrong parent via Python's negative indexing — it must be skipped."""
+    import types
+    mock_cohere.Client = lambda *a, **kw: types.SimpleNamespace(
+        rerank=lambda **kw: types.SimpleNamespace(results=[
+            types.SimpleNamespace(index=-1, relevance_score=0.99),
+            types.SimpleNamespace(index=1, relevance_score=0.5),
+        ]),
+    )
+    mock_cohere.ClientV2 = mock_cohere.Client
+
+    out = rerank("query", _parents(), top_k=3)
+    assert [p.parent_id for p in out] == [2]
+    assert out[0].rerank_score == 0.5
+
+
 def test_falls_through_when_cohere_returns_empty(mock_cohere, mock_cross_encoder):
     """A Cohere call that succeeds but returns zero results must still
     trigger the local fallback — otherwise the user sees an empty answer

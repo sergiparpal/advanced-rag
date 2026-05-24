@@ -284,11 +284,13 @@ class Store:
 
     def iter_chunks_ordered(self) -> Iterator[ChunkRow]:
         conn = self.connect()
+        # No JOIN with parents needed — every chunk has parent_id NOT NULL by
+        # schema and we don't read any parents columns. The canonical order
+        # (parent_id, ord) is purely a `chunks` ordering.
         for r in conn.execute(
-            "SELECT c.id, c.parent_id, c.ord, c.text, c.embed_row, "
-            "       c.contextual_prefix, c.text_for_embedding, c.text_for_bm25 "
-            "FROM chunks c JOIN parents p ON p.id = c.parent_id "
-            "ORDER BY c.parent_id, c.ord"
+            "SELECT id, parent_id, ord, text, embed_row, "
+            "       contextual_prefix, text_for_embedding, text_for_bm25 "
+            "FROM chunks ORDER BY parent_id, ord"
         ):
             yield ChunkRow(
                 id=r["id"], parent_id=r["parent_id"], ord=r["ord"],
@@ -297,6 +299,16 @@ class Store:
                 text_for_embedding=r["text_for_embedding"],
                 text_for_bm25=r["text_for_bm25"],
             )
+
+    def get_chunk_ids_ordered(self) -> list[int]:
+        """Just the chunk ids in canonical (parent_id, ord) order. Engine
+        uses this on every load to rebuild `_chunk_ids`; pulling only `id`
+        avoids materializing the full row × text × prefix payload.
+        """
+        conn = self.connect()
+        return [r["id"] for r in conn.execute(
+            "SELECT id FROM chunks ORDER BY parent_id, ord"
+        )]
 
     def bulk_update_embed_rows(self, pairs: list[tuple[int, int]]) -> None:
         """pairs: list of (chunk_id, embed_row)."""
@@ -309,6 +321,11 @@ class Store:
     # --- read helpers ---
 
     def get_chunk(self, chunk_id: int) -> dict | None:
+        # Returns the v0.1 columns only. Phase 2 columns (contextual_prefix,
+        # text_for_embedding, text_for_bm25) are intentionally omitted: this
+        # accessor is for inspectors and tooling that want the raw chunk text,
+        # not the retrieval-time augmented form. Use `iter_chunks_ordered`
+        # when you need the full row.
         conn = self.connect()
         r = conn.execute(
             "SELECT c.id, c.parent_id, c.ord, c.text, c.embed_row "
@@ -327,6 +344,10 @@ class Store:
         return dict(r) if r else None
 
     def chunks_for_parent(self, parent_id: int) -> list[dict]:
+        # Same intentional omission as `get_chunk`: surfaces raw chunk text
+        # (what's actually in the document), not the contextual-augmented
+        # form. `rag_drill_down` builds on this to show users the underlying
+        # passage; the retrieval-time prefix would be confusing here.
         conn = self.connect()
         rows = conn.execute(
             "SELECT id, parent_id, ord, text, embed_row FROM chunks "
@@ -467,6 +488,12 @@ class Store:
                     pass
 
     def load_bm25(self, target_path: Path):
+        # Security note: `pickle.load` is unsafe on untrusted bytes — a tampered
+        # bm25.pkl can execute arbitrary code at load time. Threat model: the
+        # data dir (default `~/.hermes/plugins/advanced-rag/data/`) is owned by
+        # the same user that runs Hermes; anyone who can write here can already
+        # run code as that user. Don't point HERMES_RAG_DATA_DIR at a path
+        # writable by another user / process.
         with open(target_path, "rb") as f:
             return pickle.load(f)
 

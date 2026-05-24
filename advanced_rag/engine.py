@@ -58,8 +58,10 @@ class RAGEngine:
                 self._embeddings = self._store.load_embeddings(npz_p)
                 # chunk_ids is now derived from SQLite (canonical order) rather
                 # than carried in the .npz — embed_row in the DB is the source
-                # of truth for the row-index ↔ chunk-id mapping.
-                self._chunk_ids = [c.id for c in self._store.iter_chunks_ordered()]
+                # of truth for the row-index ↔ chunk-id mapping. Pull only
+                # the ids (not the full row payload) to keep cold load fast
+                # on large corpora.
+                self._chunk_ids = self._store.get_chunk_ids_ordered()
             else:
                 self._embeddings = None
                 self._chunk_ids = []
@@ -150,10 +152,9 @@ class RAGEngine:
         """Best-effort document count for the loaded BM25 instance.
         rank_bm25's BM25Okapi keeps `corpus_size`; older or stub objects may
         not, so we degrade silently rather than refuse to load."""
-        for attr in ("corpus_size",):
-            n = getattr(self._bm25, attr, None)
-            if isinstance(n, int):
-                return n
+        n = getattr(self._bm25, "corpus_size", None)
+        if isinstance(n, int):
+            return n
         doc_freqs = getattr(self._bm25, "doc_freqs", None)
         if isinstance(doc_freqs, list):
             return len(doc_freqs)

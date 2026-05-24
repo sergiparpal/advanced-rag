@@ -84,6 +84,23 @@ def test_paraphrases_dedupe_against_query_and_each_other(mock_anthropic):
     assert out[-1] == "h"
 
 
+def test_hyde_dedupes_against_query_and_paraphrases(mock_anthropic):
+    """If the model echoes the query into `hyde`, it must not survive the
+    dedup — wasting a hybrid_search variant on an identical string only
+    hurts latency."""
+    import types
+    mock_anthropic.Anthropic = lambda *a, **kw: types.SimpleNamespace(
+        messages=types.SimpleNamespace(create=lambda **kw: types.SimpleNamespace(
+            content=[types.SimpleNamespace(
+                text='{"paraphrases": ["alt"], "hyde": "hello world"}'
+            )]
+        ))
+    )
+    out = expand_query("hello world")
+    # original + 1 paraphrase, with the duplicated hyde dropped.
+    assert out == ["hello world", "alt"]
+
+
 def test_anthropic_client_is_cached_across_calls(mock_anthropic):
     """L9: the SDK client is reused; one constructor call covers many queries."""
     constructions = {"n": 0}

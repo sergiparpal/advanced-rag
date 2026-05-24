@@ -39,6 +39,13 @@ def _build_preamble(prefix: str, min_body_chars: int) -> Parent | None:
     lifting a leading `# H1` line out as the title) is shorter than
     ``min_body_chars`` — that case is almost always boilerplate (a lone title
     line, a one-line status note) and not worth a parent of its own.
+
+    H1 handling: ``_H1_RE.search`` returns the *first* H1 in the preamble. If
+    the document opens with one H1 followed by paragraphs that's the common
+    case and works fine. Multiple H1s before the first `##` are unusual; only
+    the first becomes the preamble title, and any later H1 lines stay in the
+    body verbatim. Newlines around the spliced H1 are preserved, so the body
+    reads naturally even when the H1 sits mid-prefix.
     """
     if not prefix or not prefix.strip():
         return None

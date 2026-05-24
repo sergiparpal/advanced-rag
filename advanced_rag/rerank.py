@@ -35,7 +35,9 @@ def _try_cohere(query: str, parents: list[ParentResult], top_k: int) -> list[Par
         for r in response.results:
             idx = getattr(r, "index", None)
             score = getattr(r, "relevance_score", None)
-            if idx is None or idx >= len(parents):
+            # Guard against bogus indices in either direction; negative values
+            # would silently wrap around to index from the end of `parents`.
+            if not isinstance(idx, int) or idx < 0 or idx >= len(parents):
                 continue
             p = parents[idx]
             p.rerank_score = float(score) if score is not None else None

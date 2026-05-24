@@ -139,7 +139,10 @@ def test_ambient_never_calls_cohere(warmed_engine, monkeypatch,
 def test_warm_hook_warms_cross_encoder(monkeypatch):
     """Phase 3 invariant: on_session_start preloads the cross-encoder so the
     first ambient rerank doesn't pay the cold-load cost."""
+    from advanced_rag import adapters as adapters_mod
     from advanced_rag.adapters import make_session_warm_hook
+
+    adapters_mod._reset_warm_for_tests()
 
     warmed = {"called": False}
 
@@ -237,11 +240,55 @@ def test_ambient_convo_memory_path_used_when_enabled(
 
     ambient_pre_llm_call(
         session_id="conv-1", user_message="cosmic rays particles",
-        conversation_history=None, is_first_turn=True,
+        conversation_history=None,
     )
     assert seen["vec_path"] is True
     # And the ring buffer now has the current turn's embedding.
     assert len(convo_mod.get_ring("conv-1")) == 1
+
+
+def test_ambient_convo_memory_falls_back_when_encode_returns_empty(
+    warmed_engine, monkeypatch, mock_cross_encoder,
+):
+    """If the embedder returns a (0, dim) array (e.g. a stub bug, or a
+    pathological model), the convo path must fall back to the literal
+    hybrid_search rather than crash."""
+    monkeypatch.setenv("HERMES_RAG_AMBIENT_CONVO_MEMORY", "1")
+    monkeypatch.setattr(hooks_mod, "AMBIENT_SCORE_THRESHOLD", 0.0)
+    mock_cross_encoder._scores = [5.0] * 10
+
+    seen = {"vec_path": False, "literal_path": False}
+    real_vec = hooks_mod.retrieval.hybrid_search_with_vec
+    real_lit = hooks_mod.retrieval.hybrid_search
+
+    def spy_vec(*a, **kw):
+        seen["vec_path"] = True
+        return real_vec(*a, **kw)
+
+    def spy_lit(*a, **kw):
+        seen["literal_path"] = True
+        return real_lit(*a, **kw)
+
+    monkeypatch.setattr(hooks_mod.retrieval, "hybrid_search_with_vec", spy_vec)
+    monkeypatch.setattr(hooks_mod.retrieval, "hybrid_search", spy_lit)
+
+    # Force the embedder to return (0, dim) — the empty-batch shape.
+    real_encode = warmed_engine._embedder.encode
+
+    def _empty_encode(texts, batch_size=64):
+        return np.zeros((0, 32), dtype=np.float32)
+
+    warmed_engine._embedder.encode = _empty_encode
+    try:
+        ambient_pre_llm_call(
+            session_id="conv-empty", user_message="cosmic rays particles",
+            conversation_history=None,
+        )
+    finally:
+        warmed_engine._embedder.encode = real_encode
+
+    assert seen["vec_path"] is False
+    assert seen["literal_path"] is True
 
 
 # --- latency budget ---

@@ -152,7 +152,10 @@ def reformulate_query(
                            reason=judge_reason or "(no reason given)")}],
         )
         text = "".join(getattr(part, "text", "") for part in msg.content).strip()
-        text = text.strip("\"' \n")
+        # Strip whatever the model wrapped the rewrite in: ASCII quotes,
+        # backticks, smart quotes (U+2018-201D), and surrounding whitespace.
+        # The prompt asks for the query alone, but Haiku occasionally wraps it.
+        text = text.strip("\"' \n\t`‘’“”")
         return text or None
     except Exception as e:
         log.warning("CRAG reformulate failed: %s", e)

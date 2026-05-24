@@ -6,6 +6,7 @@ one place is the only way to keep BM25 scoring honest.
 """
 from __future__ import annotations
 
+import heapq
 import re
 from dataclasses import dataclass
 from typing import Iterable
@@ -41,6 +42,16 @@ class ParentResult:
     source_path: str
     score: float
     rerank_score: float | None = None
+
+    @property
+    def effective_score(self) -> float:
+        """Post-rerank score when available, otherwise the RRF score.
+
+        Callers gating on a relevance threshold should compare against this
+        single attribute so identity-fallback (rerank unavailable) doesn't
+        require its own branch.
+        """
+        return self.rerank_score if self.rerank_score is not None else self.score
 
 
 def rrf_fuse(rankings: list[list[int]], k: int = RRF_K) -> dict[int, float]:
@@ -131,7 +142,9 @@ def _materialize_hits(
     fused = rrf_fuse([bm25_ranked, dense_ranked])
     if not fused:
         return []
-    top = sorted(fused.items(), key=lambda kv: -kv[1])[:k_pool]
+    # heapq.nlargest is O(N log k); full sort is O(N log N). Cheap improvement
+    # given `fused` can hold thousands of (chunk_id, score) pairs.
+    top = heapq.nlargest(k_pool, fused.items(), key=lambda kv: kv[1])
     # One SQL roundtrip for the whole batch instead of N+1 per-chunk lookups.
     parent_by_chunk = engine._store.parent_ids_for_chunks([cid for cid, _ in top])
     out: list[Hit] = []
@@ -153,7 +166,7 @@ def chunks_to_parents(engine, hits: Iterable[Hit], top: int) -> list[ParentResul
         if prev is None or h.score > prev:
             by_parent[h.parent_id] = h.score
 
-    ranked = sorted(by_parent.items(), key=lambda kv: -kv[1])[:top]
+    ranked = heapq.nlargest(top, by_parent.items(), key=lambda kv: kv[1])
     # Single batched fetch for all top parent rows.
     parent_rows = engine._store.get_parents([pid for pid, _ in ranked])
     out: list[ParentResult] = []

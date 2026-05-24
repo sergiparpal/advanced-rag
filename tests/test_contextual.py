@@ -288,3 +288,87 @@ def test_rebuild_uses_text_for_embedding(
     # sentinel because the recording-anthropic always returns "CTXSENTINEL".
     assert seen_texts
     assert all(t.startswith("CTXSENTINEL\n\n") for t in seen_texts)
+
+
+def test_contextual_generation_uses_thread_pool(
+    tmp_data_dir, tmp_path, stub_embedder, monkeypatch,
+):
+    """Contextual prefixes for chunks of one parent are generated concurrently
+    so a large parent doesn't pay N × per-call latency. Verifiable by
+    counting concurrent in-flight calls."""
+    import threading
+    import time
+    monkeypatch.setenv("HERMES_RAG_CONTEXTUAL", "1")
+
+    in_flight = {"current": 0, "peak": 0}
+    lock = threading.Lock()
+
+    mod = types.ModuleType("anthropic")
+
+    class _Msg:
+        def __init__(self, t):
+            self.content = [types.SimpleNamespace(text=t)]
+
+    class _Messages:
+        def create(self, **kw):
+            with lock:
+                in_flight["current"] += 1
+                in_flight["peak"] = max(in_flight["peak"], in_flight["current"])
+            try:
+                # Hold the call long enough for siblings to pile up if the
+                # caller is running serially.
+                time.sleep(0.05)
+                return _Msg("prefix")
+            finally:
+                with lock:
+                    in_flight["current"] -= 1
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            self.messages = _Messages()
+
+    mod.Anthropic = _Client
+    monkeypatch.setitem(sys.modules, "anthropic", mod)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    contextual._reset_client_for_tests()
+
+    # Build a single doc whose parent will split into many chunks so the
+    # thread pool has something to parallelize.
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    long_section = " ".join(f"word{i}" for i in range(2000))
+    (docs / "big.md").write_text(f"# T\n\n## Section\n{long_section}\n")
+
+    store = Store()
+    index_path(docs, store=store, embedder=stub_embedder)
+    # Concurrency cap is 4 in config; we only need to confirm we ran more
+    # than 1 in parallel to prove the serial loop is gone.
+    assert in_flight["peak"] >= 2, (
+        f"contextual generation appears serial; peak in-flight = "
+        f"{in_flight['peak']}"
+    )
+
+
+def test_contextual_skips_whitespace_only_pieces(
+    tmp_data_dir, tmp_path, stub_embedder, monkeypatch,
+):
+    """A parent whose recursive_split happens to yield a whitespace-only
+    piece must not produce an empty chunk row."""
+    monkeypatch.delenv("HERMES_RAG_CONTEXTUAL", raising=False)
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    # A section header with no body — recursive_split returns [], falling
+    # back to [parent.text] which itself may be whitespace.
+    (docs / "empty.md").write_text("# T\n\n## Section\n\n   \n\t\n")
+
+    store = Store()
+    summary = index_path(docs, store=store, embedder=stub_embedder)
+    # File is indexed, but the empty section produces no chunk rows.
+    assert summary["files_added_or_updated"] == 1
+    # Every chunk that *did* land must have non-empty text.
+    rows = store.connect().execute(
+        "SELECT text FROM chunks"
+    ).fetchall()
+    for r in rows:
+        assert r["text"].strip(), "indexer leaked an empty/whitespace chunk"

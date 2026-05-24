@@ -8,6 +8,7 @@ import hashlib
 import logging
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,7 @@ from . import contextual
 from .chunking import recursive_split
 from .config import (
     CHUNK_OVERLAP,
+    CONTEXTUAL_CONCURRENCY,
     MAX_CHUNK,
     bm25_path,
     npz_path,
@@ -91,15 +93,29 @@ def _index_file(store: Store, path: Path) -> tuple[int, int, int]:
     for pid, parent in zip(parent_ids, parents):
         pieces = recursive_split(parent.text, max_size=MAX_CHUNK,
                                  overlap=CHUNK_OVERLAP) or [parent.text]
+        # Drop any whitespace-only piece so we don't insert empty chunk rows
+        # — extract_* should already filter these, but a degenerate parent
+        # (e.g. a paragraph of only whitespace) can still slip through here.
+        pieces = [p for p in pieces if p and p.strip()]
+        if not pieces:
+            continue
 
         prefixes: list[str | None] = [None] * len(pieces)
         if use_contextual:
             # Same parent across calls → Anthropic prompt cache amortizes the
-            # parent block; chunks pay roughly chunk_tokens + completion.
-            for i, piece in enumerate(pieces):
-                prefixes[i] = contextual.generate_contextual_prefix(
-                    parent.text, piece,
-                )
+            # parent block. Chunks of one parent are issued concurrently so a
+            # large corpus doesn't pay N × per-call latency end-to-end; the
+            # cache turns the second+ in-flight call into a cheap cache hit.
+            with ThreadPoolExecutor(max_workers=CONTEXTUAL_CONCURRENCY) as ex:
+                futures = [
+                    ex.submit(contextual.generate_contextual_prefix,
+                              parent.text, piece)
+                    for piece in pieces
+                ]
+                for i, fut in enumerate(futures):
+                    # `generate_contextual_prefix` returns None on any failure
+                    # — never raises — so this never crashes the index run.
+                    prefixes[i] = fut.result()
 
         chunk_rows: list[tuple] = []
         for ord_, (piece, prefix) in enumerate(zip(pieces, prefixes)):
@@ -131,6 +147,12 @@ def index_path(path, force: bool = False, store: Store | None = None,
     if not root.exists():
         raise FileNotFoundError(f"index path does not exist: {root}")
 
+    # `store_owned` tracks whether we constructed the Store ourselves. When
+    # the caller passed one (tests, alternate data dirs), we must NOT reset
+    # the process-wide engine at the end — that singleton may be bound to a
+    # different data_dir and resetting it would cost the next ambient call
+    # a cold reload for unrelated reasons.
+    store_owned = store is None
     own_store = store or Store()
     if embedder is None:
         from .embeddings import Embedder as _Emb
@@ -185,12 +207,15 @@ def index_path(path, force: bool = False, store: Store | None = None,
     rebuild_artifacts(own_store, embedder)
 
     # If an engine singleton has been created, drop its cached state so the
-    # next query reloads from the freshly written .npz / .pkl.
-    try:
-        from .engine import get_engine  # local import to avoid cycles at module load
-        get_engine().reset()
-    except Exception:
-        pass
+    # next query reloads from the freshly written .npz / .pkl. Only reset
+    # when we own the store: caller-supplied stores belong to a different
+    # data_dir (tests, isolated runs) and the singleton would be unrelated.
+    if store_owned:
+        try:
+            from .engine import get_engine  # local import to avoid cycles at module load
+            get_engine().reset()
+        except Exception:
+            pass
 
     return {
         "indexed_root": str(root),

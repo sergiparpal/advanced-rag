@@ -53,6 +53,10 @@ def recursive_split(
     callers must size buffers against ``max_size + overlap``, not ``max_size``
     alone. The parent cap (``MAX_PARENT_CHARS``) absorbs the slop downstream.
     """
+    if max_size <= 0:
+        raise ValueError(f"max_size must be positive, got {max_size}")
+    if overlap < 0:
+        raise ValueError(f"overlap must be non-negative, got {overlap}")
     if text is None:
         return []
     if not text.strip():

@@ -69,7 +69,14 @@ class Embedder:
             if dim is None:
                 self._load_model()
                 dim = self._dim
-            return np.zeros((0, dim or 0), dtype=np.float32)
+            if dim is None:
+                raise RuntimeError(
+                    f"could not determine embedding dim for "
+                    f"{self._model_name!r}: model load did not expose "
+                    "`get_sentence_embedding_dimension`. Set HERMES_RAG_EMBED_DIM "
+                    "explicitly to skip auto-detect."
+                )
+            return np.zeros((0, dim), dtype=np.float32)
         self._load_model()
         vecs = self._model.encode(
             list(texts),

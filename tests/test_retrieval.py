@@ -148,3 +148,21 @@ def test_format_context_packs_within_cap():
 
 def test_format_context_empty_input_returns_empty():
     assert format_context([], token_cap=1500) == ""
+
+
+def test_effective_score_prefers_rerank():
+    from advanced_rag.retrieval import ParentResult
+
+    p = ParentResult(parent_id=1, title="A", kind="section", page_no=None,
+                     text="x", source_path="/x.md", score=0.05,
+                     rerank_score=4.2)
+    assert p.effective_score == 4.2
+
+
+def test_effective_score_falls_back_to_rrf():
+    from advanced_rag.retrieval import ParentResult
+
+    p = ParentResult(parent_id=1, title="A", kind="section", page_no=None,
+                     text="x", source_path="/x.md", score=0.05,
+                     rerank_score=None)
+    assert p.effective_score == 0.05

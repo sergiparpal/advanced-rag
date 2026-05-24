@@ -1,4 +1,18 @@
+import pytest
+
 from advanced_rag.chunking import recursive_split
+
+
+def test_invalid_max_size_raises():
+    with pytest.raises(ValueError, match="max_size"):
+        recursive_split("anything", max_size=0)
+    with pytest.raises(ValueError, match="max_size"):
+        recursive_split("anything", max_size=-1)
+
+
+def test_invalid_overlap_raises():
+    with pytest.raises(ValueError, match="overlap"):
+        recursive_split("anything", max_size=100, overlap=-1)
 
 
 def test_empty_input_returns_empty_list():
