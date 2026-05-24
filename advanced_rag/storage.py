@@ -347,6 +347,21 @@ class Store:
             "data_dir": str(self.data_dir),
         }
 
+    # --- meta key/value ---
+
+    def get_meta(self, key: str) -> str | None:
+        conn = self.connect()
+        r = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return r["value"] if r else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, str(value)),
+            )
+
     # --- atomic embeddings + bm25 IO ---
 
     def save_embeddings(self, target_path: Path, embeddings: np.ndarray,

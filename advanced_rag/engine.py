@@ -100,6 +100,52 @@ class RAGEngine:
                     f"{n_emb} — re-run `hermes rag index <path> --force`."
                 )
 
+        # Embedding-model alignment: catch the silent corruption case where
+        # the .npz was built with a different model than the currently
+        # configured one. Dim mismatch is fatal; pure-id mismatch (same dim,
+        # different family) is loud-but-non-fatal.
+        on_disk_dim = self._store.get_meta("embed_dim")
+        live_dim = int(self._embeddings.shape[1])
+        if on_disk_dim is not None:
+            try:
+                disk_dim = int(on_disk_dim)
+            except ValueError:
+                disk_dim = None
+            if disk_dim is not None and disk_dim != live_dim:
+                self._embeddings = None
+                self._chunk_ids = []
+                self._bm25 = None
+                raise EngineLoadError(
+                    f"embeddings.npz dim {live_dim} disagrees with stored "
+                    f"meta dim {disk_dim} — re-run "
+                    "`hermes rag index <path> --force`."
+                )
+
+        configured_dim = getattr(self._embedder, "dim", None)
+        if configured_dim and configured_dim != live_dim:
+            self._embeddings = None
+            self._chunk_ids = []
+            self._bm25 = None
+            raise EngineLoadError(
+                f"configured embedder dim {configured_dim} disagrees with "
+                f".npz dim {live_dim} — re-run "
+                "`hermes rag index <path> --force` "
+                "(or unset HERMES_RAG_EMBED_MODEL / HERMES_RAG_EMBED_DIM)."
+            )
+
+        on_disk_model = self._store.get_meta("embed_model")
+        configured_model = getattr(self._embedder, "model_name", None) or getattr(
+            self._embedder, "_model_name", None
+        )
+        if on_disk_model and configured_model and on_disk_model != configured_model:
+            log.warning(
+                "embedding-model drift: index was built with %r but the "
+                "current configuration is %r. Dimensions match so retrieval "
+                "will still run, but quality may degrade until a "
+                "`hermes rag index --force` rebuilds the .npz.",
+                on_disk_model, configured_model,
+            )
+
     def _bm25_doc_count(self) -> int | None:
         """Best-effort document count for the loaded BM25 instance.
         rank_bm25's BM25Okapi keeps `corpus_size`; older or stub objects may

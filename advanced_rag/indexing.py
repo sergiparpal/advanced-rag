@@ -214,3 +214,11 @@ def rebuild_artifacts(store: Store, embedder) -> None:
 
     # canonical row-index ↔ chunk_id mapping into SQLite
     store.bulk_update_embed_rows([(cid, row) for row, cid in enumerate(chunk_ids)])
+
+    # Pin the embedding model id (and dim) that produced this .npz so a
+    # subsequent load can warn loudly when the configured model has changed.
+    model_name = getattr(embedder, "model_name", None) or getattr(
+        embedder, "_model_name", "unknown"
+    )
+    store.set_meta("embed_model", str(model_name))
+    store.set_meta("embed_dim", str(int(embeddings.shape[1])))

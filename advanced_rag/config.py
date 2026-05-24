@@ -45,16 +45,58 @@ RRF_K = 60
 AMBIENT_TOP_PARENTS = 3
 AMBIENT_TOKEN_CAP = 1500
 AMBIENT_SCORE_THRESHOLD = 0.25
-EMBED_MODEL = "all-MiniLM-L6-v2"
-# Embedding dimensionality keyed on the model name. Used to pre-allocate the
-# `(0, dim)` empty-result array in `Embedder.encode([])` without loading the
-# model. Add an entry here when you swap the model — otherwise the empty-input
-# fallback would silently use the wrong shape and break downstream consumers.
+# Modern multilingual default. Override at runtime with HERMES_RAG_EMBED_MODEL
+# (any sentence-transformers-compatible id). Switching models requires a full
+# `hermes rag index --force` — the .npz dim won't match otherwise.
+DEFAULT_EMBED_MODEL = "BAAI/bge-m3"
+# Known dimensionalities. Used to pre-allocate the `(0, dim)` empty-result
+# array in `Embedder.encode([])` without loading the model. Anything missing
+# here is auto-detected on first load by querying the model itself.
 EMBED_MODEL_DIMS: dict[str, int] = {
     "all-MiniLM-L6-v2": 384,
+    "sentence-transformers/all-MiniLM-L6-v2": 384,
     "BAAI/bge-base-en-v1.5": 768,
     "BAAI/bge-small-en-v1.5": 384,
+    "BAAI/bge-m3": 1024,
 }
+
+
+def get_embed_model() -> str:
+    """Configured embedding model id. HERMES_RAG_EMBED_MODEL overrides the
+    default; unset → DEFAULT_EMBED_MODEL."""
+    env = os.environ.get("HERMES_RAG_EMBED_MODEL")
+    return env.strip() if env and env.strip() else DEFAULT_EMBED_MODEL
+
+
+def get_embed_dim() -> int | None:
+    """Optional manual dimension override via HERMES_RAG_EMBED_DIM. Returns
+    None when unset/invalid so the Embedder auto-detects from the loaded
+    model."""
+    env = os.environ.get("HERMES_RAG_EMBED_DIM")
+    if not env:
+        return None
+    try:
+        n = int(env)
+        return n if n > 0 else None
+    except ValueError:
+        return None
+
+
+# Legacy alias kept so existing imports of `EMBED_MODEL` keep working. The
+# canonical accessor is now `get_embed_model()`.
+EMBED_MODEL = DEFAULT_EMBED_MODEL
 RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 COHERE_RERANK_MODEL = "rerank-english-v3.0"
+
+# Contextual Retrieval (Phase 2) — opt-in via HERMES_RAG_CONTEXTUAL=1.
+CONTEXTUAL_MAX_TOKENS = 150  # output cap for the prefix-generation LLM call
+
+# CRAG-lite (Phase 4) — opt-in via HERMES_RAG_CRAG=1.
+
+# Ambient conversational memory (Phase 3) — opt-in via
+# HERMES_RAG_AMBIENT_CONVO_MEMORY=1. Weights apply to current/previous/older
+# user turn embeddings, normalized before mixing.
+AMBIENT_CONVO_MEMORY_WEIGHTS = (1.0, 0.25, 0.1)
+# Top-K pool that survives the lightweight ambient rerank.
+AMBIENT_RERANK_POOL = 10

@@ -185,18 +185,36 @@ pip install /path/to/clone
 
 ## Configuration
 
-All three environment variables are optional — every one of them gracefully
-degrades when unset.
+Every environment variable is optional — each one gracefully degrades when
+unset.
 
-| Variable              | Purpose                                                                                                                                                                                                |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `COHERE_API_KEY`      | Optional. Enables Cohere reranker (`rerank-english-v3.0`). Without it, falls back to a local cross-encoder (~80 MB download on first use). Get one at <https://dashboard.cohere.com/api-keys>.         |
-| `ANTHROPIC_API_KEY`   | Optional. Enables LLM-based query expansion (paraphrases + HyDE) via `claude-haiku-4-5`. Without it, expansion is skipped and the original query is used. Get one at <https://console.anthropic.com/>. |
-| `HERMES_RAG_DATA_DIR` | Optional. Override the data directory (defaults to `~/.hermes/plugins/advanced-rag/data`). Useful for tests and isolated runs.                                                                         |
+| Variable                          | Purpose                                                                                                                                                                                                                                                  |
+| --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `COHERE_API_KEY`                  | Enables Cohere reranker (`rerank-english-v3.0`) on the **explicit** path. Falls back to a local cross-encoder (~80 MB on first use) when unset. The ambient path never calls Cohere. Get one at <https://dashboard.cohere.com/api-keys>.                 |
+| `ANTHROPIC_API_KEY`               | Enables LLM features that depend on Anthropic: query expansion, contextual retrieval (Phase 2), CRAG-lite (Phase 4). Without it, each feature silently degrades. Get one at <https://console.anthropic.com/>.                                            |
+| `HERMES_RAG_DATA_DIR`             | Override the data directory (defaults to `~/.hermes/plugins/advanced-rag/data`). Useful for tests and isolated runs.                                                                                                                                     |
+| `HERMES_RAG_EMBED_MODEL`          | Override the sentence-transformers model id. Defaults to `BAAI/bge-m3` (multilingual, 1024-d). Any model id the SDK can load works (e.g. `sentence-transformers/all-MiniLM-L6-v2`). **Switching models requires `hermes rag index --force`** — the dim won't match the on-disk `.npz` otherwise; the engine refuses to load with a clear error pointing at `--force`. |
+| `HERMES_RAG_EMBED_DIM`            | Manually pin the embedding dimension. Almost never needed: the dim is auto-detected on first model load (for unknown ids) or read from a built-in table (for known ones).                                                                               |
+| `HERMES_RAG_CONTEXTUAL`           | Set to `1` to enable Anthropic-style **Contextual Retrieval** (Phase 2). At index time, each chunk gets a 50–100-token prefix locating it in its parent; both BM25 and the dense index store `prefix + chunk`. Costs Anthropic tokens per indexed chunk (prompt caching keeps it cheap). Without it, behavior matches v0.1. |
+| `HERMES_RAG_AMBIENT_CONVO_MEMORY` | Set to `1` to mix the current query embedding with the previous 1–2 user-turn embeddings in the **ambient** path only. Helps with follow-ups ("explain more about that"); contaminates retrieval when the user changes topic — that's why it is off by default. |
+| `HERMES_RAG_CRAG`                 | Set to `1` to enable **CRAG-lite** (Phase 4) on the explicit `rag_search` path: after retrieval an LLM critiques the parents; if insufficient, the query is reformulated and retrieval runs once more (hard-capped at one retry). Robustness layer, not a replacement for better retrieval — enable after Phase 2 (Contextual Retrieval). |
 
 The data directory is created lazily by `Store(get_data_dir())` on first
 index/use. It is **not** tracked in git and is safe to delete (`hermes rag
 clear`).
+
+### Embedding model trade-offs
+
+- The default `BAAI/bge-m3` is multilingual and ~2.2 GB on disk; first index
+  on a fresh machine downloads it. Quality is meaningfully better than
+  MiniLM on cross-lingual and long-tail vocabulary.
+- For an English-only corpus on a low-RAM machine, set
+  `HERMES_RAG_EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2`
+  (~80 MB, 384-d) and reindex. Quality regresses but the runtime footprint
+  drops dramatically.
+- BM25 is **always** kept as the sparse path regardless of the model — it's
+  the only thing keeping lexical-match queries (acronyms, code symbols, exact
+  phrases) from falling off the dense index.
 
 ## Usage
 
