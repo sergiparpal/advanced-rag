@@ -1,4 +1,4 @@
-# advanced-rag
+# hermes-hybrid-rag
 
 A Hermes Agent plugin for retrieval-augmented generation over local user
 documents (`md` / `txt` / `pdf`).
