@@ -25,6 +25,20 @@ class ChunkRow:
     ord: int
     text: str
     embed_row: int
+    contextual_prefix: str | None = None
+    text_for_embedding: str | None = None
+    text_for_bm25: str | None = None
+
+    @property
+    def effective_embedding_text(self) -> str:
+        """Phase 2: `prefix + chunk` when contextual retrieval is active,
+        else the raw chunk. Single source of truth so embeddings rebuild and
+        any future inspectors agree."""
+        return self.text_for_embedding or self.text
+
+    @property
+    def effective_bm25_text(self) -> str:
+        return self.text_for_bm25 or self.text
 
 
 SCHEMA_DDL = """
@@ -54,11 +68,14 @@ CREATE TABLE IF NOT EXISTS parents (
 CREATE INDEX IF NOT EXISTS idx_parents_file ON parents(file_id);
 
 CREATE TABLE IF NOT EXISTS chunks (
-  id         INTEGER PRIMARY KEY,
-  parent_id  INTEGER NOT NULL REFERENCES parents(id) ON DELETE CASCADE,
-  ord        INTEGER NOT NULL,
-  text       TEXT    NOT NULL,
-  embed_row  INTEGER NOT NULL
+  id                 INTEGER PRIMARY KEY,
+  parent_id          INTEGER NOT NULL REFERENCES parents(id) ON DELETE CASCADE,
+  ord                INTEGER NOT NULL,
+  text               TEXT    NOT NULL,
+  embed_row          INTEGER NOT NULL,
+  contextual_prefix  TEXT,
+  text_for_embedding TEXT,
+  text_for_bm25      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_parent ON chunks(parent_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_embed_row ON chunks(embed_row);
@@ -116,7 +133,20 @@ class Store:
 
     def init_schema(self, conn: sqlite3.Connection) -> None:
         conn.executescript(SCHEMA_DDL)
+        self._migrate_schema(conn)
         conn.commit()
+
+    def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        """Lazy migrations for existing on-disk DBs. Currently:
+
+        - Phase 2 (contextual retrieval): add `contextual_prefix`,
+          `text_for_embedding`, `text_for_bm25` columns to `chunks` if
+          missing. New DBs already have them via the DDL above.
+        """
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(chunks)").fetchall()}
+        for new_col in ("contextual_prefix", "text_for_embedding", "text_for_bm25"):
+            if new_col not in cols:
+                conn.execute(f"ALTER TABLE chunks ADD COLUMN {new_col} TEXT")
 
     # --- manifest diff ---
 
@@ -216,16 +246,37 @@ class Store:
         return ids
 
     def bulk_insert_chunks(self, rows: list[tuple]) -> list[int]:
-        """rows: list of (parent_id, ord, text, embed_row). Returns chunk_ids."""
+        """Insert chunks. Each row is either:
+
+        - 4-tuple `(parent_id, ord, text, embed_row)` — legacy / contextual
+          retrieval off; new columns stay NULL.
+        - 7-tuple `(parent_id, ord, text, embed_row, contextual_prefix,
+          text_for_embedding, text_for_bm25)` — Phase 2 contextual rows.
+
+        Rows of mixed length in the same call are fine. Returns chunk_ids."""
         ids: list[int] = []
         if not rows:
             return ids
         with self.transaction() as conn:
             for r in rows:
-                cur = conn.execute(
-                    "INSERT INTO chunks(parent_id, ord, text, embed_row) VALUES (?, ?, ?, ?)",
-                    r,
-                )
+                if len(r) == 4:
+                    cur = conn.execute(
+                        "INSERT INTO chunks(parent_id, ord, text, embed_row) "
+                        "VALUES (?, ?, ?, ?)",
+                        r,
+                    )
+                elif len(r) == 7:
+                    cur = conn.execute(
+                        "INSERT INTO chunks(parent_id, ord, text, embed_row, "
+                        "contextual_prefix, text_for_embedding, text_for_bm25) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        r,
+                    )
+                else:
+                    raise ValueError(
+                        f"bulk_insert_chunks: expected 4- or 7-tuple, got "
+                        f"len {len(r)}"
+                    )
                 ids.append(cur.lastrowid)
         return ids
 
@@ -234,12 +285,18 @@ class Store:
     def iter_chunks_ordered(self) -> Iterator[ChunkRow]:
         conn = self.connect()
         for r in conn.execute(
-            "SELECT c.id, c.parent_id, c.ord, c.text, c.embed_row "
+            "SELECT c.id, c.parent_id, c.ord, c.text, c.embed_row, "
+            "       c.contextual_prefix, c.text_for_embedding, c.text_for_bm25 "
             "FROM chunks c JOIN parents p ON p.id = c.parent_id "
             "ORDER BY c.parent_id, c.ord"
         ):
-            yield ChunkRow(id=r["id"], parent_id=r["parent_id"], ord=r["ord"],
-                           text=r["text"], embed_row=r["embed_row"])
+            yield ChunkRow(
+                id=r["id"], parent_id=r["parent_id"], ord=r["ord"],
+                text=r["text"], embed_row=r["embed_row"],
+                contextual_prefix=r["contextual_prefix"],
+                text_for_embedding=r["text_for_embedding"],
+                text_for_bm25=r["text_for_bm25"],
+            )
 
     def bulk_update_embed_rows(self, pairs: list[tuple[int, int]]) -> None:
         """pairs: list of (chunk_id, embed_row)."""

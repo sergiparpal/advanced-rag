@@ -14,6 +14,7 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
+from . import contextual
 from .chunking import recursive_split
 from .config import (
     CHUNK_OVERLAP,
@@ -85,11 +86,33 @@ def _index_file(store: Store, path: Path) -> tuple[int, int, int]:
                    for i, p in enumerate(parents)]
     parent_ids = store.bulk_insert_parents(parent_rows)
 
+    use_contextual = contextual.is_contextual_enabled()
     chunk_count = 0
     for pid, parent in zip(parent_ids, parents):
         pieces = recursive_split(parent.text, max_size=MAX_CHUNK,
                                  overlap=CHUNK_OVERLAP) or [parent.text]
-        chunk_rows = [(pid, ord_, piece, 0) for ord_, piece in enumerate(pieces)]
+
+        prefixes: list[str | None] = [None] * len(pieces)
+        if use_contextual:
+            # Same parent across calls → Anthropic prompt cache amortizes the
+            # parent block; chunks pay roughly chunk_tokens + completion.
+            for i, piece in enumerate(pieces):
+                prefixes[i] = contextual.generate_contextual_prefix(
+                    parent.text, piece,
+                )
+
+        chunk_rows: list[tuple] = []
+        for ord_, (piece, prefix) in enumerate(zip(pieces, prefixes)):
+            if prefix:
+                composed = prefix + "\n\n" + piece
+                chunk_rows.append(
+                    (pid, ord_, piece, 0, prefix, composed, composed)
+                )
+            else:
+                # Contextual off or prefix generation failed for this chunk —
+                # behavior matches v0.1 (4-tuple insert; new columns stay
+                # NULL; retrieval falls back to raw `text`).
+                chunk_rows.append((pid, ord_, piece, 0))
         store.bulk_insert_chunks(chunk_rows)
         chunk_count += len(chunk_rows)
 
@@ -194,14 +217,18 @@ def rebuild_artifacts(store: Store, embedder) -> None:
                 p.unlink()
         return
 
-    texts = [r.text for r in rows]
+    # Phase 2: prefer the contextual-composed text when present; fall back to
+    # the raw chunk for rows indexed without contextual retrieval. Both lists
+    # are the same length and in canonical order.
+    embed_texts = [r.effective_embedding_text for r in rows]
+    bm25_texts = [r.effective_bm25_text for r in rows]
     chunk_ids = [r.id for r in rows]
 
-    embeddings = embedder.encode(texts)
-    if embeddings.shape[0] != len(texts):
+    embeddings = embedder.encode(embed_texts)
+    if embeddings.shape[0] != len(embed_texts):
         raise RuntimeError("embedder returned wrong number of vectors")
 
-    tokenized = [_tokenize(t) for t in texts]
+    tokenized = [_tokenize(t) for t in bm25_texts]
     bm25 = BM25Okapi(tokenized)
 
     # Stage both .tmp files first, then commit back-to-back: embeddings.npz

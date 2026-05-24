@@ -139,7 +139,7 @@ flowchart TB
 
 Module boundaries:
 
-- **Pure modules** (no Hermes import, unit-tested directly): `chunking.py`, `parents.py`, `storage.py`, `embeddings.py`, `indexing.py`, `retrieval.py`, `expansion.py`, `rerank.py`, `engine.py`, `state.py`, `hooks.py`, `tools.py`, `schemas.py`, `cli.py`, `slash.py`, `config.py`.
+- **Pure modules** (no Hermes import, unit-tested directly): `chunking.py`, `parents.py`, `storage.py`, `embeddings.py`, `indexing.py`, `retrieval.py`, `expansion.py`, `rerank.py`, `contextual.py`, `crag.py`, `engine.py`, `state.py`, `hooks.py`, `tools.py`, `schemas.py`, `cli.py`, `slash.py`, `config.py`.
 - **Hermes-coupled surface** (only files to edit if Hermes' API drifts): `__init__.py::register(ctx)` and `adapters.py`.
 
 ### 3.2 Project layout (deployable artifact)
@@ -404,11 +404,14 @@ CREATE TABLE IF NOT EXISTS parents (
 CREATE INDEX IF NOT EXISTS idx_parents_file ON parents(file_id);
 
 CREATE TABLE IF NOT EXISTS chunks (
-  id         INTEGER PRIMARY KEY,
-  parent_id  INTEGER NOT NULL REFERENCES parents(id) ON DELETE CASCADE,
-  ord        INTEGER NOT NULL,
-  text       TEXT    NOT NULL,
-  embed_row  INTEGER NOT NULL
+  id                 INTEGER PRIMARY KEY,
+  parent_id          INTEGER NOT NULL REFERENCES parents(id) ON DELETE CASCADE,
+  ord                INTEGER NOT NULL,
+  text               TEXT    NOT NULL,    -- raw chunk (text_original)
+  embed_row          INTEGER NOT NULL,
+  contextual_prefix  TEXT,                -- Phase 2 contextual retrieval; NULL when off
+  text_for_embedding TEXT,                -- prefix + "\n\n" + text when prefix set
+  text_for_bm25      TEXT                 -- same composition rule
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_parent ON chunks(parent_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_embed_row ON chunks(embed_row);
@@ -418,6 +421,10 @@ CREATE TABLE IF NOT EXISTS meta (
   value TEXT NOT NULL
 );
 ```
+
+The `meta` table currently tracks `embed_model` and `embed_dim`, written by the indexer after every artifact rebuild. The engine compares them against the configured embedder on load (hard-fail on dim mismatch, warn on same-dim model drift).
+
+The Phase 2 contextual columns (`contextual_prefix`, `text_for_embedding`, `text_for_bm25`) are added lazily on first connect when an older on-disk DB is opened — `Store._migrate_schema` runs an idempotent `ALTER TABLE … ADD COLUMN` for each missing column.
 
 #### Atomic writes
 
