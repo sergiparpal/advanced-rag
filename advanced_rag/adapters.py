@@ -66,9 +66,13 @@ def make_hook_wrapper():
 
 
 def make_session_warm_hook():
-    """Warm the engine on new sessions. Background thread — never blocks
-    session_start. Hermes fires this only on brand-new sessions
-    (run_agent.py:10519), so the cost is paid once per session.
+    """Warm the engine + ambient reranker on new sessions. Background thread
+    — never blocks session_start. Hermes fires this only on brand-new
+    sessions (run_agent.py:10519), so the cost is paid once per session.
+
+    Phase 3: the ambient path reranks every turn with the local
+    cross-encoder; preload that here too so the first per-turn rerank
+    doesn't pay the model-download / model-load cost.
     """
     def _warm(*, session_id="", model="", platform="", **_):
         import threading
@@ -79,10 +83,12 @@ def make_session_warm_hook():
                 get_engine()._ensure_loaded()
             except Exception as e:
                 # Cold load on first ambient call is the fallback. Never raise.
-                # Logged at DEBUG so users who opt in (e.g. by enabling debug
-                # logging for advanced_rag) can spot warm failures; default
-                # level keeps the swallow silent.
                 log.debug("session warm-up failed (cold load will retry): %s", e)
+            try:
+                from .rerank import warm_local_cross_encoder
+                warm_local_cross_encoder()
+            except Exception as e:
+                log.debug("cross-encoder warm-up failed: %s", e)
 
         threading.Thread(target=_bg, daemon=True).start()
     return _warm

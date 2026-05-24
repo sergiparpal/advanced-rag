@@ -1,13 +1,23 @@
 """Ambient pre-LLM-call hook. Injects up to AMBIENT_TOP_PARENTS parents into
 the prompt when the user message looks substantive and the top result clears
 the threshold. Must never raise — return None on any failure path.
+
+Phase 3 pipeline (vs v0.1):
+    hybrid → top-30 chunks → MAX rollup → **top-10 parents**
+        → **local cross-encoder rerank** → top-3 parents
+        → 0.25 threshold (post-rerank) → 1500-token cap
+
+The local-only rerank is intentional: Cohere's API latency would defeat the
+purpose of a cheap per-turn injection layer. The explicit `rag_search` path
+keeps using Cohere when available.
 """
 from __future__ import annotations
 
 import logging
 
-from . import retrieval, state
+from . import convo, rerank, retrieval, state
 from .config import (
+    AMBIENT_RERANK_POOL,
     AMBIENT_SCORE_THRESHOLD,
     AMBIENT_TOKEN_CAP,
     AMBIENT_TOP_PARENTS,
@@ -42,13 +52,29 @@ def ambient_pre_llm_call(
         if engine._embeddings is None or engine._embeddings.shape[0] == 0:
             return None
 
-        hits = retrieval.hybrid_search(engine, user_message, k_pool=30)
+        hits = _ambient_hybrid_search(engine, user_message, session_id)
         if not hits:
             return None
         parents = retrieval.chunks_to_parents(
-            engine, hits, top=AMBIENT_TOP_PARENTS,
+            engine, hits, top=AMBIENT_RERANK_POOL,
         )
-        if not parents or parents[0].score < AMBIENT_SCORE_THRESHOLD:
+        if not parents:
+            return None
+
+        # Local-only rerank — never Cohere on the per-turn path.
+        parents = rerank.rerank_local(
+            user_message, parents, top_k=AMBIENT_TOP_PARENTS,
+        )
+        if not parents:
+            return None
+
+        # Threshold now applies to the post-rerank score. Identity fallback
+        # (cross-encoder absent) preserves the RRF score on `score`; the
+        # check below tolerates either.
+        top_score = parents[0].rerank_score
+        if top_score is None:
+            top_score = parents[0].score
+        if top_score < AMBIENT_SCORE_THRESHOLD:
             return None
 
         context = retrieval.format_context(parents, token_cap=AMBIENT_TOKEN_CAP)
@@ -58,3 +84,23 @@ def ambient_pre_llm_call(
     except Exception as e:
         log.warning("ambient_pre_llm_call failed: %s", e)
         return None
+
+
+def _ambient_hybrid_search(engine, user_message: str, session_id: str | None):
+    """Hybrid search for the ambient path. When convo memory is enabled,
+    mix the current query embedding with the previous turns' embeddings
+    before dense scoring; BM25 always operates on the literal current
+    message so lexical search isn't contaminated."""
+    if convo.is_enabled() and session_id:
+        # Compute the query embedding once, mix with history, push into ring.
+        qvec_batch = engine._embedder.encode([user_message])
+        if qvec_batch.shape[0] == 0:
+            return retrieval.hybrid_search(engine, user_message, k_pool=30)
+        cur = qvec_batch[0]
+        ring = convo.get_ring(session_id)
+        mixed = convo.mix_with_history(cur, ring)
+        convo.push(session_id, cur)
+        return retrieval.hybrid_search_with_vec(
+            engine, user_message, mixed, k_pool=30,
+        )
+    return retrieval.hybrid_search(engine, user_message, k_pool=30)

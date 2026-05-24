@@ -52,15 +52,26 @@ toggle is on and the user message is ≥ 8 chars:
 user_message ─► hybrid_search (BM25+dense, RRF, top-30 chunks)
                        │
                        ▼
-                chunks_to_parents (MAX rollup) → top-3 parents
+                chunks_to_parents (MAX rollup) → top-10 parents
                        │
-                       ▼ score ≥ 0.25 threshold
+                       ▼ local cross-encoder rerank
+                       │
+                       ▼ top-3 parents · score ≥ 0.25 (post-rerank)
                 format_context (1500-token cap) → {"context": ...}
 ```
 
-No query expansion. No reranking. This is deliberate — keeping per-turn
-latency low — but it means the "Advanced RAG" techniques (expansion +
-rerank) only apply on the explicit tool path.
+No query expansion. No Cohere call. The rerank step is intentionally
+**local-only** — adding a Cohere round-trip would defeat the purpose of
+the cheap injection layer. The threshold of 0.25 now applies to the
+post-rerank score: cross-encoder logits are typically much higher than
+RRF scores, so the threshold is mostly a "don't inject obviously
+irrelevant text" guard rather than a tight filter.
+
+When `HERMES_RAG_AMBIENT_CONVO_MEMORY=1`, the query embedding is mixed
+with the previous 1–2 user turns' embeddings before dense search (BM25
+still operates on the literal current message). Helps with follow-ups
+("explain more about that"); contaminates retrieval when the user
+switches topic. Off by default.
 
 **Explicit path** — `tool_rag_search(query, k=5)`:
 
@@ -111,7 +122,8 @@ query ─► expand_query → [q, p1, p2, p3, hyde]   (Haiku; falls back to [q])
 
 - An ambient `pre_llm_call` hook that injects the top-3 most relevant
   parents (cap 1500 tokens) every turn, gated by a 0.25 relevance
-  threshold. **Hybrid retrieval only — no expansion, no rerank.**
+  threshold. Hybrid retrieval → top-10 → **local cross-encoder rerank**
+  → top-3. No query expansion. No Cohere call.
 - Three tools:
   - `rag_search(query, k=5)` — full pipeline with expansion + rerank.
   - `rag_drill_down(parent_id)` — every chunk under a parent, in order.

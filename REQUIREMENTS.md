@@ -272,9 +272,11 @@ Cheap rejects (return `None`):
 - `len(user_message.strip()) < 8`.
 - Engine has no embeddings loaded.
 - `hybrid_search` returns no hits.
-- Top parent's score is below `AMBIENT_SCORE_THRESHOLD`.
+- Top parent's **post-rerank** score is below `AMBIENT_SCORE_THRESHOLD`.
 
-Otherwise: `chunks_to_parents` → top `AMBIENT_TOP_PARENTS` (=3) → `format_context` capped at `AMBIENT_TOKEN_CAP` (=1500 tokens) → return `{"context": <text>}`.
+Otherwise (Phase 3 pipeline): `chunks_to_parents` → top `AMBIENT_RERANK_POOL` (=10) → `rerank.rerank_local` (local cross-encoder; never Cohere) → top `AMBIENT_TOP_PARENTS` (=3) → `format_context` capped at `AMBIENT_TOKEN_CAP` (=1500 tokens) → return `{"context": <text>}`.
+
+When `HERMES_RAG_AMBIENT_CONVO_MEMORY=1`, the dense-side query vector is the L2-normalized linear combination of the current and previous 1–2 user-turn embeddings (weights default `1.0 / 0.25 / 0.1`, normalized). BM25 always tokenizes the literal current message — lexical search stays uncontaminated.
 
 The full body is wrapped in `try/except Exception: return None`. Hooks must never raise.
 

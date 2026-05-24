@@ -70,13 +70,19 @@ def _bm25_topk(engine, query_tokens: list[str], k: int) -> list[int]:
     return [engine._chunk_ids[i] for i in idx if scores[i] > 0]
 
 
-def _dense_topk(engine, query: str, k: int) -> list[int]:
+def _dense_topk_from_vec(engine, qvec: np.ndarray, k: int) -> list[int]:
+    """Dense top-k from a pre-computed query vector. Used by the ambient
+    path so it can mix prior-turn embeddings into the query (convo memory)
+    before scoring against the corpus."""
     if engine._embeddings is None or engine._embeddings.shape[0] == 0:
         return []
-    qvec = engine._embedder.encode([query])  # (1, dim), L2-normalized
-    if qvec.shape[0] == 0:
+    if qvec is None or qvec.size == 0 or qvec.ndim != 1:
         return []
-    sims = engine._embeddings @ qvec[0]
+    if qvec.shape[0] != engine._embeddings.shape[1]:
+        # Dim drift between query and index — caller should reset; the safe
+        # behavior here is "no dense hits" rather than a noisy crash.
+        return []
+    sims = engine._embeddings @ qvec
     n = sims.shape[0]
     k = min(k, n)
     if k <= 0:
@@ -86,12 +92,42 @@ def _dense_topk(engine, query: str, k: int) -> list[int]:
     return [engine._chunk_ids[i] for i in idx]
 
 
+def _dense_topk(engine, query: str, k: int) -> list[int]:
+    if engine._embeddings is None or engine._embeddings.shape[0] == 0:
+        return []
+    qvec = engine._embedder.encode([query])  # (1, dim), L2-normalized
+    if qvec.shape[0] == 0:
+        return []
+    return _dense_topk_from_vec(engine, qvec[0], k)
+
+
 def hybrid_search(engine, query: str, k_pool: int = 30) -> list[Hit]:
     """BM25 + dense, fused with RRF. Returns top k_pool Hits with parent_id
     resolved from the SQLite store."""
     tokens = _tokenize(query)
     bm25_ranked = _bm25_topk(engine, tokens, k_pool * 2)
     dense_ranked = _dense_topk(engine, query, k_pool * 2)
+    return _materialize_hits(engine, bm25_ranked, dense_ranked, k_pool)
+
+
+def hybrid_search_with_vec(
+    engine, query: str, qvec: np.ndarray, k_pool: int = 30,
+) -> list[Hit]:
+    """Variant where the dense-side query vector is supplied by the caller.
+
+    Used by the ambient path under `HERMES_RAG_AMBIENT_CONVO_MEMORY=1` to
+    feed a mixed (current + prior turns) vector into dense search while
+    keeping BM25 honest on the literal current message.
+    """
+    tokens = _tokenize(query)
+    bm25_ranked = _bm25_topk(engine, tokens, k_pool * 2)
+    dense_ranked = _dense_topk_from_vec(engine, qvec, k_pool * 2)
+    return _materialize_hits(engine, bm25_ranked, dense_ranked, k_pool)
+
+
+def _materialize_hits(
+    engine, bm25_ranked: list[int], dense_ranked: list[int], k_pool: int,
+) -> list[Hit]:
     fused = rrf_fuse([bm25_ranked, dense_ranked])
     if not fused:
         return []

@@ -86,3 +86,35 @@ def rerank(query: str, parents: list[ParentResult], top_k: int) -> list[ParentRe
         return local_out
     # identity fallback
     return parents[:top_k]
+
+
+def rerank_local(query: str, parents: list[ParentResult], top_k: int) -> list[ParentResult]:
+    """Local-cross-encoder-only variant used by the **ambient** path (Phase 3).
+
+    Cohere is intentionally never called from the ambient path: a per-turn
+    HTTP round-trip would defeat the purpose of the cheap injection layer.
+    The explicit `rag_search` path keeps using `rerank` (Cohere → local →
+    identity).
+    """
+    if not parents:
+        return []
+    local_out = _try_local_cross_encoder(query, parents, top_k)
+    if local_out:
+        return local_out
+    return parents[:top_k]
+
+
+def warm_local_cross_encoder() -> None:
+    """Pre-load the local cross-encoder so the first ambient rerank is hot.
+
+    Called from `on_session_start` (in a background thread). Silent on any
+    failure — cold load on the first ambient rerank is the fallback.
+    """
+    global _CROSS
+    if _CROSS is not None:
+        return
+    try:
+        from sentence_transformers import CrossEncoder
+        _CROSS = CrossEncoder(RERANK_MODEL)
+    except Exception as e:
+        log.debug("cross-encoder warm-up failed (will retry on demand): %s", e)
