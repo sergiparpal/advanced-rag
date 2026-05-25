@@ -1,7 +1,7 @@
-"""Phase 3 — reinforced ambient path.
+"""Reinforced ambient path.
 
 Covers:
-- Ambient now reranks via the local cross-encoder (top-10 → top-3).
+- Ambient reranks via the local cross-encoder (top-10 → top-3).
 - Ambient never calls Cohere even when COHERE_API_KEY is set.
 - Cross-encoder warm-up runs in on_session_start.
 - Convo memory is off by default; toggle works; mixing is L2-normalized.
@@ -19,7 +19,7 @@ import advanced_rag.convo as convo_mod
 import advanced_rag.hooks as hooks_mod
 import advanced_rag.rerank as rerank_mod
 import advanced_rag.state as state_mod
-from advanced_rag.engine import RAGEngine, set_engine_for_tests
+from advanced_rag.engine import RAGEngine, reset_for_tests, set_engine_for_tests
 from advanced_rag.hooks import ambient_pre_llm_call
 from advanced_rag.indexing import index_path
 from advanced_rag.storage import Store
@@ -29,10 +29,10 @@ FIXTURES = Path(__file__).parent / "fixtures" / "docs"
 
 @pytest.fixture(autouse=True)
 def _reset_state_cache():
-    state_mod.invalidate_cache_for_tests()
+    state_mod.reset_for_tests()
     convo_mod.reset_for_tests()
     yield
-    state_mod.invalidate_cache_for_tests()
+    state_mod.reset_for_tests()
     convo_mod.reset_for_tests()
 
 
@@ -48,7 +48,7 @@ def warmed_engine(tmp_data_dir, tmp_path, stub_embedder):
     eng._ensure_loaded()
     set_engine_for_tests(eng)
     yield eng
-    set_engine_for_tests(None)
+    reset_for_tests()
 
 
 # --- ambient now reranks ---
@@ -137,12 +137,12 @@ def test_ambient_never_calls_cohere(warmed_engine, monkeypatch,
 # --- warm-up wires the cross-encoder ---
 
 def test_warm_hook_warms_cross_encoder(monkeypatch):
-    """Phase 3 invariant: on_session_start preloads the cross-encoder so the
-    first ambient rerank doesn't pay the cold-load cost."""
+    """Ambient invariant: on_session_start preloads the cross-encoder so
+    the first ambient rerank doesn't pay the cold-load cost."""
     from advanced_rag import adapters as adapters_mod
     from advanced_rag.adapters import make_session_warm_hook
 
-    adapters_mod._reset_warm_for_tests()
+    adapters_mod.reset_for_tests()
 
     warmed = {"called": False}
 

@@ -5,9 +5,8 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import re
 
+from . import _anthropic
 from .config import ANTHROPIC_MODEL
 
 log = logging.getLogger(__name__)
@@ -25,44 +24,6 @@ Output a single JSON object (no surrounding text, no code fences) with two keys:
 Return only the JSON. Do not explain.
 """
 
-_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
-
-
-def _strip_fences(text: str) -> str:
-    m = _FENCE_RE.search(text)
-    return m.group(1).strip() if m else text.strip()
-
-
-# Module-level Anthropic client cache. Reusing a single client across calls
-# keeps the underlying httpx connection pool warm and lets the SDK's
-# prompt-caching layer share state — both noticeably improve cache-hit rate
-# and remove a few ms of per-call setup. The client is lazy because the
-# `anthropic` package is an optional dep and may not be installed.
-_ANTHROPIC_CLIENT = None
-
-
-def _get_anthropic_client():
-    """Return a cached `anthropic.Anthropic` client, or None if the SDK is not
-    installed. Importing inside the function keeps the optional dependency
-    truly optional."""
-    global _ANTHROPIC_CLIENT
-    if _ANTHROPIC_CLIENT is not None:
-        return _ANTHROPIC_CLIENT
-    try:
-        import anthropic
-    except ImportError:
-        return None
-    _ANTHROPIC_CLIENT = anthropic.Anthropic()
-    return _ANTHROPIC_CLIENT
-
-
-def _reset_anthropic_client_for_tests() -> None:
-    """Test helper. Forces the next `expand_query` call to re-import and
-    re-create the client — needed because `mock_anthropic` swaps `sys.modules`
-    per test."""
-    global _ANTHROPIC_CLIENT
-    _ANTHROPIC_CLIENT = None
-
 
 def expand_query(q: str) -> list[str]:
     """Return [q] (fallback) or [q, p1, p2, p3, hyde] when expansion succeeds.
@@ -73,16 +34,13 @@ def expand_query(q: str) -> list[str]:
     duplicate.
 
     Failure modes that fall back silently to [q]:
-      - `import anthropic` fails (package not installed)
-      - ANTHROPIC_API_KEY env var unset
+      - `anthropic` SDK missing or `ANTHROPIC_API_KEY` unset
       - Any exception raised by the SDK call
       - Response missing the expected JSON structure
     """
     if not q or not q.strip():
         return [q] if q else []
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        return [q]
-    client = _get_anthropic_client()
+    client = _anthropic.get_client()
     if client is None:
         return [q]
 
@@ -92,8 +50,7 @@ def expand_query(q: str) -> list[str]:
             max_tokens=512,
             messages=[{"role": "user", "content": _PROMPT.format(q=q)}],
         )
-        text = "".join(getattr(part, "text", "") for part in msg.content)
-        payload = json.loads(_strip_fences(text))
+        payload = json.loads(_anthropic.strip_json_fences(_anthropic.extract_text(msg)))
         paraphrases = payload.get("paraphrases", []) or []
         hyde = payload.get("hyde", "") or ""
         out = [q]

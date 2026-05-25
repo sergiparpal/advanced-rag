@@ -14,9 +14,9 @@ returns None and the indexer proceeds with the raw chunk text.
 from __future__ import annotations
 
 import logging
-import os
 
-from .config import ANTHROPIC_MODEL, CONTEXTUAL_MAX_TOKENS
+from . import _anthropic
+from .config import ANTHROPIC_MODEL, CONTEXTUAL_MAX_TOKENS, env_flag
 
 log = logging.getLogger(__name__)
 
@@ -29,36 +29,9 @@ _CHUNK_INSTRUCTION = (
     "nothing else."
 )
 
-_CLIENT = None
-
-
-def _get_client():
-    """Return a cached `anthropic.Anthropic` client, or None if the SDK is
-    not installed / no API key is set. The lazy import keeps the dependency
-    truly optional."""
-    global _CLIENT
-    if _CLIENT is not None:
-        return _CLIENT
-    try:
-        import anthropic
-    except ImportError:
-        return None
-    try:
-        _CLIENT = anthropic.Anthropic()
-    except Exception:
-        return None
-    return _CLIENT
-
-
-def _reset_client_for_tests() -> None:
-    global _CLIENT
-    _CLIENT = None
-
 
 def is_contextual_enabled() -> bool:
-    """True when HERMES_RAG_CONTEXTUAL is a truthy value. Off by default."""
-    val = os.environ.get("HERMES_RAG_CONTEXTUAL", "").strip().lower()
-    return val in ("1", "true", "yes", "on")
+    return env_flag("HERMES_RAG_CONTEXTUAL")
 
 
 def generate_contextual_prefix(
@@ -78,9 +51,7 @@ def generate_contextual_prefix(
     """
     if not parent_text or not chunk_text:
         return None
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        return None
-    cli = client if client is not None else _get_client()
+    cli = client if client is not None else _anthropic.get_client()
     if cli is None:
         return None
 
@@ -105,7 +76,7 @@ def generate_contextual_prefix(
                 }
             ],
         )
-        text = "".join(getattr(part, "text", "") for part in msg.content).strip()
+        text = _anthropic.extract_text(msg).strip()
         return text or None
     except Exception as e:
         # Per spec: never abort an index run because contextual generation

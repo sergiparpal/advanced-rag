@@ -5,7 +5,7 @@ import pytest
 
 import advanced_rag.hooks as hooks_mod
 import advanced_rag.state as state_mod
-from advanced_rag.engine import RAGEngine, set_engine_for_tests
+from advanced_rag.engine import RAGEngine, reset_for_tests, set_engine_for_tests
 from advanced_rag.hooks import ambient_pre_llm_call
 from advanced_rag.indexing import index_path
 from advanced_rag.storage import Store
@@ -15,9 +15,9 @@ FIXTURES = Path(__file__).parent / "fixtures" / "docs"
 
 @pytest.fixture(autouse=True)
 def _reset_state_cache():
-    state_mod.invalidate_cache_for_tests()
+    state_mod.reset_for_tests()
     yield
-    state_mod.invalidate_cache_for_tests()
+    state_mod.reset_for_tests()
 
 
 @pytest.fixture
@@ -33,12 +33,12 @@ def warmed_engine(tmp_data_dir, tmp_path, stub_embedder):
     eng._ensure_loaded()
     set_engine_for_tests(eng)
     yield eng
-    set_engine_for_tests(None)
+    reset_for_tests()
 
 
 def test_returns_none_when_disabled(warmed_engine, monkeypatch):
     state_mod.set_ambient(False)
-    state_mod.invalidate_cache_for_tests()
+    state_mod.reset_for_tests()
     out = ambient_pre_llm_call(
         session_id=None, user_message="cosmic rays from space",
         conversation_history=None, is_first_turn=True, model=None, platform=None,
@@ -110,4 +110,4 @@ def test_returns_none_on_empty_index(tmp_data_dir, stub_embedder):
         )
         assert out is None
     finally:
-        set_engine_for_tests(None)
+        reset_for_tests()

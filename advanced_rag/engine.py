@@ -37,9 +37,32 @@ class RAGEngine:
         self._loaded = False
         self._lock = threading.Lock()
 
+    # --- public read-only views over the loaded state ---
+    #
+    # Sibling modules (`retrieval`, `hooks`) read these to score queries.
+    # Properties (vs raw attribute access) declare the access boundary and
+    # let us swap the backing store later (e.g. memmap) without touching
+    # every caller.
+
     @property
     def store(self) -> Store:
         return self._store
+
+    @property
+    def embedder(self):
+        return self._embedder
+
+    @property
+    def embeddings(self):
+        return self._embeddings
+
+    @property
+    def chunk_ids(self) -> list[int]:
+        return self._chunk_ids
+
+    @property
+    def bm25(self):
+        return self._bm25
 
     def _make_default_embedder(self):
         from .embeddings import Embedder
@@ -82,56 +105,72 @@ class RAGEngine:
             return None
         return BM25Okapi(tokenized)
 
+    def _invalidate_and_raise(self, message: str) -> None:
+        """Scrub the loaded state and raise ``EngineLoadError``. Centralises
+        the three-line reset that every consistency check would otherwise
+        copy-paste."""
+        self._embeddings = None
+        self._chunk_ids = []
+        self._bm25 = None
+        raise EngineLoadError(message)
+
     def _check_consistency(self) -> None:
         """Refuse to serve queries if the loaded artifacts disagree about
-        cardinality — a partial rebuild can leave .npz and the SQLite chunks
-        table in inconsistent states."""
+        cardinality or model identity. A partial rebuild can leave .npz and
+        the SQLite chunks table in inconsistent states; catching that here
+        is much better than letting it surface as an IndexError deep in
+        retrieval.
+        """
         if self._embeddings is None:
             return
+        self._check_cardinality()
+        self._check_disk_dim()
+        self._check_configured_dim()
+        self._check_model_drift()
+
+    def _check_cardinality(self) -> None:
         n_emb = int(self._embeddings.shape[0])
         n_ids = len(self._chunk_ids)
         if n_emb != n_ids:
-            self._embeddings = None
-            self._chunk_ids = []
-            self._bm25 = None
-            raise EngineLoadError(
+            self._invalidate_and_raise(
                 f"embeddings array has {n_emb} rows but SQLite has "
                 f"{n_ids} chunks — re-run `hermes rag index <path> --force`."
             )
 
-        # Embedding-model alignment: catch the silent corruption case where
-        # the .npz was built with a different model than the currently
-        # configured one. Dim mismatch is fatal; pure-id mismatch (same dim,
-        # different family) is loud-but-non-fatal.
+    def _check_disk_dim(self) -> None:
+        """Catch the silent corruption case where the .npz was built with a
+        different model than the currently configured one."""
         on_disk_dim = self._store.get_meta("embed_dim")
+        if on_disk_dim is None:
+            return
+        try:
+            disk_dim = int(on_disk_dim)
+        except ValueError:
+            return
         live_dim = int(self._embeddings.shape[1])
-        if on_disk_dim is not None:
-            try:
-                disk_dim = int(on_disk_dim)
-            except ValueError:
-                disk_dim = None
-            if disk_dim is not None and disk_dim != live_dim:
-                self._embeddings = None
-                self._chunk_ids = []
-                self._bm25 = None
-                raise EngineLoadError(
-                    f"embeddings.npz dim {live_dim} disagrees with stored "
-                    f"meta dim {disk_dim} — re-run "
-                    "`hermes rag index <path> --force`."
-                )
+        if disk_dim != live_dim:
+            self._invalidate_and_raise(
+                f"embeddings.npz dim {live_dim} disagrees with stored "
+                f"meta dim {disk_dim} — re-run "
+                "`hermes rag index <path> --force`."
+            )
 
+    def _check_configured_dim(self) -> None:
         configured_dim = getattr(self._embedder, "dim", None)
-        if configured_dim and configured_dim != live_dim:
-            self._embeddings = None
-            self._chunk_ids = []
-            self._bm25 = None
-            raise EngineLoadError(
+        if not configured_dim:
+            return
+        live_dim = int(self._embeddings.shape[1])
+        if configured_dim != live_dim:
+            self._invalidate_and_raise(
                 f"configured embedder dim {configured_dim} disagrees with "
                 f".npz dim {live_dim} — re-run "
                 "`hermes rag index <path> --force` "
                 "(or unset HERMES_RAG_EMBED_MODEL / HERMES_RAG_EMBED_DIM)."
             )
 
+    def _check_model_drift(self) -> None:
+        """Dim matches but the model name doesn't — quality may degrade.
+        Loud, but non-fatal: we still serve queries."""
         on_disk_model = self._store.get_meta("embed_model")
         configured_model = getattr(self._embedder, "model_name", None) or getattr(
             self._embedder, "_model_name", None
@@ -162,7 +201,14 @@ def get_engine() -> RAGEngine:
     return _INSTANCE
 
 
-def set_engine_for_tests(engine: RAGEngine | None) -> None:
-    """Test-only helper. Replaces the singleton (or clears it with None)."""
+def set_engine_for_tests(engine: RAGEngine) -> None:
+    """Test-only helper. Replaces the process singleton with ``engine``.
+    Use :func:`reset_for_tests` to clear instead."""
     global _INSTANCE
     _INSTANCE = engine
+
+
+def reset_for_tests() -> None:
+    """Test-only helper. Clears the process singleton."""
+    global _INSTANCE
+    _INSTANCE = None

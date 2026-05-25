@@ -55,17 +55,17 @@ class FakeStore:
 
 class FakeEngine:
     def __init__(self, chunk_texts, chunk_ids, parent_ids, embedder, parents):
-        self._chunk_ids = chunk_ids
+        self.chunk_ids = chunk_ids
         if chunk_texts:
             tokenized = [_tokenize(t) for t in chunk_texts]
-            self._bm25 = BM25Okapi(tokenized)
-            self._embeddings = embedder.encode(chunk_texts)
+            self.bm25 = BM25Okapi(tokenized)
+            self.embeddings = embedder.encode(chunk_texts)
         else:
-            self._bm25 = None
-            self._embeddings = np.zeros((0, 32), dtype=np.float32)
-        self._embedder = embedder
-        self._store = FakeStore(parents,
-                                {cid: pid for cid, pid in zip(chunk_ids, parent_ids)})
+            self.bm25 = None
+            self.embeddings = np.zeros((0, 32), dtype=np.float32)
+        self.embedder = embedder
+        self.store = FakeStore(parents,
+                               {cid: pid for cid, pid in zip(chunk_ids, parent_ids)})
 
 
 # --- tokenizer parity ---

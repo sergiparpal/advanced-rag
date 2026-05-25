@@ -31,7 +31,7 @@ _WARM_LAUNCHED = False
 _WARM_LOCK = threading.Lock()
 
 
-def _reset_warm_for_tests() -> None:
+def reset_for_tests() -> None:
     """Test helper. Clears the one-shot warm flag so successive tests can
     re-trigger the warm-up path."""
     global _WARM_LAUNCHED
@@ -99,9 +99,9 @@ def make_session_warm_hook():
     session (run_agent.py:10519); we gate with a one-shot flag so a
     long-running process spawns the warm thread at most once.
 
-    Phase 3: the ambient path reranks every turn with the local
-    cross-encoder; preload that here too so the first per-turn rerank
-    doesn't pay the model-download / model-load cost.
+    The ambient path reranks every turn with the local cross-encoder;
+    preload that here too so the first per-turn rerank doesn't pay the
+    model-download / model-load cost.
     """
     def _warm(*, session_id="", model="", platform="", **_):
         global _WARM_LAUNCHED

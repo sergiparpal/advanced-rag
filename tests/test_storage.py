@@ -100,8 +100,11 @@ def test_cascade_delete_kills_parents_and_chunks(tmp_data_dir):
         [(fid, 0, "section", "T1", None, "body1", 5),
          (fid, 1, "section", "T2", None, "body2", 5)]
     )
-    store.bulk_insert_chunks([(pids[0], 0, "c1", 0), (pids[0], 1, "c2", 1),
-                              (pids[1], 0, "c3", 2)])
+    store.bulk_insert_chunks([
+        (pids[0], 0, "c1", 0, None, None, None),
+        (pids[0], 1, "c2", 1, None, None, None),
+        (pids[1], 0, "c3", 2, None, None, None),
+    ])
     assert store.stats()["chunks"] == 3
     store.delete_files([fid])
     assert store.stats() == {**store.stats(), "files": 0, "parents": 0, "chunks": 0}
@@ -142,14 +145,14 @@ def test_save_embeddings_accepts_chunk_ids_for_compat(tmp_data_dir):
 
 
 def test_iter_bm25_texts_prefers_contextual(tmp_data_dir):
-    """Phase 2: when text_for_bm25 is present it shadows the raw chunk text;
+    """When text_for_bm25 is present it shadows the raw chunk text;
     otherwise the raw text is yielded. The engine builds BM25 from this
     stream — pickle is gone, the only persistent BM25 source is SQLite."""
     store = Store()
     fid = store.bulk_insert_files([("/x.md", 0.0, 0, "h", "md", 0.0)])["/x.md"]
     pid = store.bulk_insert_parents([(fid, 0, "section", "T", None, "x", 1)])[0]
     store.bulk_insert_chunks([
-        (pid, 0, "raw-zero", 0),  # no text_for_bm25 → raw text
+        (pid, 0, "raw-zero", 0, None, None, None),  # no text_for_bm25 → raw text
         (pid, 1, "raw-one", 0, "prefix", "raw-one-embed", "composed-one"),
     ])
     out = list(store.iter_bm25_texts_ordered())
@@ -164,7 +167,9 @@ def test_parent_ids_for_chunks_batched(tmp_data_dir):
         (fid, 1, "section", "T2", None, "y", 1),
     ])
     cid_a, cid_b, cid_c = store.bulk_insert_chunks([
-        (p1, 0, "a", 0), (p1, 1, "b", 0), (p2, 0, "c", 0),
+        (p1, 0, "a", 0, None, None, None),
+        (p1, 1, "b", 0, None, None, None),
+        (p2, 0, "c", 0, None, None, None),
     ])
     out = store.parent_ids_for_chunks([cid_a, cid_b, cid_c, 999_999])
     assert out == {cid_a: p1, cid_b: p1, cid_c: p2}
@@ -199,10 +204,10 @@ def test_iter_chunks_ordered_canonical_order(tmp_data_dir):
     ])
     # insert chunks out of order to confirm iter_chunks_ordered re-sorts
     store.bulk_insert_chunks([
-        (p2, 0, "from p2 ord 0", 0),
-        (p1, 1, "from p1 ord 1", 0),
-        (p1, 0, "from p1 ord 0", 0),
-        (p2, 1, "from p2 ord 1", 0),
+        (p2, 0, "from p2 ord 0", 0, None, None, None),
+        (p1, 1, "from p1 ord 1", 0, None, None, None),
+        (p1, 0, "from p1 ord 0", 0, None, None, None),
+        (p2, 1, "from p2 ord 1", 0, None, None, None),
     ])
     rows = list(store.iter_chunks_ordered())
     assert [(r.parent_id, r.ord) for r in rows] == [

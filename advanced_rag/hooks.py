@@ -2,9 +2,9 @@
 the prompt when the user message looks substantive and the top result clears
 the threshold. Must never raise — return None on any failure path.
 
-Phase 3 pipeline (vs v0.1):
-    hybrid → top-30 chunks → MAX rollup → **top-10 parents**
-        → **local cross-encoder rerank** → top-3 parents
+Ambient pipeline:
+    hybrid → top-30 chunks → MAX rollup → top-10 parents
+        → local cross-encoder rerank → top-3 parents
         → 0.25 threshold (post-rerank) → 1500-token cap
 
 The local-only rerank is intentional: Cohere's API latency would defeat the
@@ -14,6 +14,7 @@ keeps using Cohere when available.
 from __future__ import annotations
 
 import logging
+import threading
 
 from . import convo, rerank, retrieval, state
 from .config import (
@@ -27,6 +28,29 @@ from .engine import get_engine
 log = logging.getLogger(__name__)
 
 _MIN_MESSAGE_LEN = 8
+
+# Track Hermes hook kwargs we don't consume — surface them once so that an
+# upstream signature change adding a useful field doesn't go unnoticed.
+_HOOK_KNOWN_KWARGS = frozenset({
+    "session_id", "user_message", "conversation_history", "model", "platform",
+})
+_HOOK_SEEN_EXTRA_KWARGS: set[str] = set()
+_HOOK_KWARG_LOG_LOCK = threading.Lock()
+
+
+def _log_unfamiliar_kwargs(kwargs: dict) -> None:
+    """One-shot debug log per never-before-seen kwarg name. Helps spot a
+    Hermes upgrade that started passing something the hook should be
+    reading. Cheap — we only log first occurrence."""
+    extras = set(kwargs) - _HOOK_KNOWN_KWARGS - _HOOK_SEEN_EXTRA_KWARGS
+    if not extras:
+        return
+    with _HOOK_KWARG_LOG_LOCK:
+        new = extras - _HOOK_SEEN_EXTRA_KWARGS
+        if not new:
+            return
+        _HOOK_SEEN_EXTRA_KWARGS.update(new)
+        log.debug("ambient_pre_llm_call: ignoring new kwargs %s", sorted(new))
 
 
 def ambient_pre_llm_call(
@@ -43,9 +67,13 @@ def ambient_pre_llm_call(
 
     Hermes passes additional kwargs that this hook doesn't use today
     (`is_first_turn`, `sender_id`, etc.); they're absorbed by ``**kwargs`` so
-    upstream signature drift never breaks the wire.
+    upstream signature drift never breaks the wire. First-seen extras are
+    logged once at debug so an upgrade that starts passing something
+    *useful* doesn't go unnoticed.
     """
     try:
+        if kwargs:
+            _log_unfamiliar_kwargs(kwargs)
         if not state.is_ambient_enabled(session_id):
             return None
         if not user_message or len(user_message.strip()) < _MIN_MESSAGE_LEN:
@@ -53,7 +81,7 @@ def ambient_pre_llm_call(
 
         engine = get_engine()
         engine._ensure_loaded()
-        if engine._embeddings is None or engine._embeddings.shape[0] == 0:
+        if engine.embeddings is None or engine.embeddings.shape[0] == 0:
             return None
 
         hits = _ambient_hybrid_search(engine, user_message, session_id)
@@ -97,7 +125,7 @@ def _ambient_hybrid_search(engine, user_message: str, session_id: str | None):
     message so lexical search isn't contaminated."""
     if convo.is_enabled() and session_id:
         # Compute the query embedding once, mix with history, push into ring.
-        qvec_batch = engine._embedder.encode([user_message])
+        qvec_batch = engine.embedder.encode([user_message])
         if qvec_batch.shape[0] == 0:
             return retrieval.hybrid_search(engine, user_message, k_pool=30)
         cur = qvec_batch[0]

@@ -1,4 +1,4 @@
-"""Phase 4 — CRAG-lite (critique + retry on the explicit path).
+"""CRAG-lite (critique + retry on the explicit path).
 
 Covers the four paths the spec calls out:
 - sufficient first try → no retry
@@ -19,8 +19,8 @@ import pytest
 import advanced_rag.crag as crag_mod
 import advanced_rag.hooks as hooks_mod
 import advanced_rag.state as state_mod
-from advanced_rag import convo
-from advanced_rag.engine import RAGEngine, set_engine_for_tests
+from advanced_rag import _anthropic, convo
+from advanced_rag.engine import RAGEngine, reset_for_tests, set_engine_for_tests
 from advanced_rag.hooks import ambient_pre_llm_call
 from advanced_rag.indexing import index_path
 from advanced_rag.storage import Store
@@ -31,12 +31,12 @@ FIXTURES = Path(__file__).parent / "fixtures" / "docs"
 
 @pytest.fixture(autouse=True)
 def _isolate():
-    crag_mod._reset_client_for_tests()
-    state_mod.invalidate_cache_for_tests()
+    _anthropic.reset_for_tests()
+    state_mod.reset_for_tests()
     convo.reset_for_tests()
     yield
-    crag_mod._reset_client_for_tests()
-    state_mod.invalidate_cache_for_tests()
+    _anthropic.reset_for_tests()
+    state_mod.reset_for_tests()
     convo.reset_for_tests()
 
 
@@ -54,7 +54,7 @@ def warmed_engine(tmp_data_dir, tmp_path, stub_embedder, monkeypatch):
     # Don't let query expansion or Cohere kick in during search tests.
     monkeypatch.delenv("COHERE_API_KEY", raising=False)
     yield eng
-    set_engine_for_tests(None)
+    reset_for_tests()
 
 
 # --- Anthropic mock that scripts judge + reformulate ---
@@ -83,10 +83,8 @@ def _install_scripted_anthropic(monkeypatch, *, responses: list[str]):
     mod.Anthropic = _Client
     monkeypatch.setitem(sys.modules, "anthropic", mod)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    # Force fresh client constructions in both expansion and crag modules.
-    crag_mod._reset_client_for_tests()
-    from advanced_rag import expansion as _exp
-    _exp._reset_anthropic_client_for_tests()
+    # Force a fresh client construction (expansion + crag now share one).
+    _anthropic.reset_for_tests()
     return state
 
 
@@ -113,7 +111,7 @@ def test_judge_returns_sufficient_when_no_api_key(monkeypatch):
 def test_judge_returns_sufficient_when_sdk_missing(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
     monkeypatch.setitem(sys.modules, "anthropic", None)
-    crag_mod._reset_client_for_tests()
+    _anthropic.reset_for_tests()
     out = crag_mod.judge_retrieval("q", [])
     assert out["sufficient"] is True
 
@@ -163,7 +161,7 @@ def test_judge_swallows_sdk_error(monkeypatch):
     mod.Anthropic = _Client
     monkeypatch.setitem(sys.modules, "anthropic", mod)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
-    crag_mod._reset_client_for_tests()
+    _anthropic.reset_for_tests()
     out = crag_mod.judge_retrieval("q", [])
     assert out["sufficient"] is True
 
@@ -241,7 +239,7 @@ def test_crag_no_anthropic_key_skips_silently(warmed_engine, monkeypatch):
     """HERMES_RAG_CRAG=1 but no ANTHROPIC_API_KEY → CRAG is a no-op."""
     monkeypatch.setenv("HERMES_RAG_CRAG", "1")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    crag_mod._reset_client_for_tests()
+    _anthropic.reset_for_tests()
     out = json.loads(tool_rag_search({"query": "cosmic rays"}))
     assert out["crag_reformulated_query"] is None
     assert out["crag_reason"] is None

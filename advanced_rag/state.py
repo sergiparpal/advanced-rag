@@ -82,7 +82,7 @@ def set_ambient(on: bool, session_id: str | None = None) -> None:
     _store(path, data)
 
 
-def invalidate_cache_for_tests() -> None:
+def reset_for_tests() -> None:
     global _CACHE, _CACHE_TS, _CACHE_PATH
     _CACHE = None
     _CACHE_TS = 0.0

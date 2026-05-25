@@ -1,4 +1,4 @@
-"""Phase 1 — configurable embeddings.
+"""Configurable embeddings.
 
 Covers HERMES_RAG_EMBED_MODEL / HERMES_RAG_EMBED_DIM, dim mismatch detection,
 and the meta row written at index time.

@@ -15,7 +15,7 @@ import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Callable, Iterator, Sequence
 
 import numpy as np
 
@@ -35,15 +35,31 @@ class ChunkRow:
 
     @property
     def effective_embedding_text(self) -> str:
-        """Phase 2: `prefix + chunk` when contextual retrieval is active,
-        else the raw chunk. Single source of truth so embeddings rebuild and
-        any future inspectors agree."""
+        """`prefix + chunk` when contextual retrieval is active, else the raw
+        chunk. Single source of truth so embeddings rebuild and any future
+        inspectors agree."""
         return self.text_for_embedding or self.text
 
     @property
     def effective_bm25_text(self) -> str:
         return self.text_for_bm25 or self.text
 
+
+# SQLite has a fixed parameter ceiling (999 on older builds). 500 keeps us
+# safely below it for every IN-clause batch we issue.
+_SQLITE_IN_BATCH = 500
+
+# The canonical chunk ordering. The row index in this ordering IS the
+# `embed_row` — every component that walks chunks for indexing or retrieval
+# must use this exact clause.
+_CANONICAL_CHUNK_ORDER = "ORDER BY parent_id, ord"
+
+# Column list shared by `get_parent` and `get_parents` — both join `files` to
+# surface the source path and filetype on every parent row.
+_PARENT_WITH_FILE_COLS = (
+    "p.id, p.file_id, p.ord, p.kind, p.title, p.page_no, p.text, p.char_len, "
+    "f.path AS source_path, f.filetype"
+)
 
 SCHEMA_DDL = """
 PRAGMA foreign_keys = ON;
@@ -141,16 +157,43 @@ class Store:
         conn.commit()
 
     def _migrate_schema(self, conn: sqlite3.Connection) -> None:
-        """Lazy migrations for existing on-disk DBs. Currently:
+        """Lazy migrations for existing on-disk DBs.
 
-        - Phase 2 (contextual retrieval): add `contextual_prefix`,
-          `text_for_embedding`, `text_for_bm25` columns to `chunks` if
-          missing. New DBs already have them via the DDL above.
+        Adds the contextual-retrieval columns (`contextual_prefix`,
+        `text_for_embedding`, `text_for_bm25`) to `chunks` if they're missing.
+        New DBs already have them via the DDL above.
         """
         cols = {r[1] for r in conn.execute("PRAGMA table_info(chunks)").fetchall()}
         for new_col in ("contextual_prefix", "text_for_embedding", "text_for_bm25"):
             if new_col not in cols:
                 conn.execute(f"ALTER TABLE chunks ADD COLUMN {new_col} TEXT")
+
+    # --- batched IN-clause helper ---
+
+    def _select_in_batches(
+        self,
+        ids: Sequence[int],
+        select_sql_template: str,
+        row_to_kv: Callable[[sqlite3.Row], tuple],
+    ) -> dict:
+        """Run an ``IN (?, ?, …)`` query batched at ``_SQLITE_IN_BATCH`` and
+        merge results into a single dict keyed by ``row_to_kv``.
+
+        ``select_sql_template`` must contain a ``{qmarks}`` placeholder where
+        the comma-joined ``?`` list goes — letting callers express any column
+        list / join shape while sharing the batching machinery.
+        """
+        if not ids:
+            return {}
+        conn = self.connect()
+        out: dict = {}
+        for start in range(0, len(ids), _SQLITE_IN_BATCH):
+            batch = list(ids[start:start + _SQLITE_IN_BATCH])
+            qmarks = ",".join("?" * len(batch))
+            for r in conn.execute(select_sql_template.format(qmarks=qmarks), batch):
+                k, v = row_to_kv(r)
+                out[k] = v
+        return out
 
     # --- manifest diff ---
 
@@ -250,37 +293,29 @@ class Store:
         return ids
 
     def bulk_insert_chunks(self, rows: list[tuple]) -> list[int]:
-        """Insert chunks. Each row is either:
+        """Insert chunks. Each row is a 7-tuple:
 
-        - 4-tuple `(parent_id, ord, text, embed_row)` — legacy / contextual
-          retrieval off; new columns stay NULL.
-        - 7-tuple `(parent_id, ord, text, embed_row, contextual_prefix,
-          text_for_embedding, text_for_bm25)` — Phase 2 contextual rows.
+            (parent_id, ord, text, embed_row,
+             contextual_prefix, text_for_embedding, text_for_bm25)
 
-        Rows of mixed length in the same call are fine. Returns chunk_ids."""
+        The last three columns are NULLable — pass ``None`` for them when
+        contextual retrieval is off. Returns chunk_ids in input order.
+        """
         ids: list[int] = []
         if not rows:
             return ids
         with self.transaction() as conn:
             for r in rows:
-                if len(r) == 4:
-                    cur = conn.execute(
-                        "INSERT INTO chunks(parent_id, ord, text, embed_row) "
-                        "VALUES (?, ?, ?, ?)",
-                        r,
+                if len(r) != 7:
+                    raise RuntimeError(
+                        f"bulk_insert_chunks: expected 7-tuple, got len {len(r)}"
                     )
-                elif len(r) == 7:
-                    cur = conn.execute(
-                        "INSERT INTO chunks(parent_id, ord, text, embed_row, "
-                        "contextual_prefix, text_for_embedding, text_for_bm25) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        r,
-                    )
-                else:
-                    raise ValueError(
-                        f"bulk_insert_chunks: expected 4- or 7-tuple, got "
-                        f"len {len(r)}"
-                    )
+                cur = conn.execute(
+                    "INSERT INTO chunks(parent_id, ord, text, embed_row, "
+                    "contextual_prefix, text_for_embedding, text_for_bm25) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    r,
+                )
                 ids.append(cur.lastrowid)
         return ids
 
@@ -289,12 +324,11 @@ class Store:
     def iter_chunks_ordered(self) -> Iterator[ChunkRow]:
         conn = self.connect()
         # No JOIN with parents needed — every chunk has parent_id NOT NULL by
-        # schema and we don't read any parents columns. The canonical order
-        # (parent_id, ord) is purely a `chunks` ordering.
+        # schema and we don't read any parents columns.
         for r in conn.execute(
             "SELECT id, parent_id, ord, text, embed_row, "
             "       contextual_prefix, text_for_embedding, text_for_bm25 "
-            "FROM chunks ORDER BY parent_id, ord"
+            f"FROM chunks {_CANONICAL_CHUNK_ORDER}"
         ):
             yield ChunkRow(
                 id=r["id"], parent_id=r["parent_id"], ord=r["ord"],
@@ -305,13 +339,12 @@ class Store:
             )
 
     def get_chunk_ids_ordered(self) -> list[int]:
-        """Just the chunk ids in canonical (parent_id, ord) order. Engine
-        uses this on every load to rebuild `_chunk_ids`; pulling only `id`
-        avoids materializing the full row × text × prefix payload.
-        """
+        """Just the chunk ids in canonical order. Engine uses this on every
+        load to rebuild `_chunk_ids`; pulling only `id` avoids materializing
+        the full row × text × prefix payload."""
         conn = self.connect()
         return [r["id"] for r in conn.execute(
-            "SELECT id FROM chunks ORDER BY parent_id, ord"
+            f"SELECT id FROM chunks {_CANONICAL_CHUNK_ORDER}"
         )]
 
     def bulk_update_embed_rows(self, pairs: list[tuple[int, int]]) -> None:
@@ -325,11 +358,11 @@ class Store:
     # --- read helpers ---
 
     def get_chunk(self, chunk_id: int) -> dict | None:
-        # Returns the v0.1 columns only. Phase 2 columns (contextual_prefix,
-        # text_for_embedding, text_for_bm25) are intentionally omitted: this
-        # accessor is for inspectors and tooling that want the raw chunk text,
-        # not the retrieval-time augmented form. Use `iter_chunks_ordered`
-        # when you need the full row.
+        # Returns the v0.1 columns only. The contextual-retrieval columns
+        # (contextual_prefix, text_for_embedding, text_for_bm25) are
+        # intentionally omitted: this accessor is for inspectors and tooling
+        # that want the raw chunk text, not the retrieval-time augmented form.
+        # Use `iter_chunks_ordered` when you need the full row.
         conn = self.connect()
         r = conn.execute(
             "SELECT c.id, c.parent_id, c.ord, c.text, c.embed_row "
@@ -340,8 +373,7 @@ class Store:
     def get_parent(self, parent_id: int) -> dict | None:
         conn = self.connect()
         r = conn.execute(
-            "SELECT p.id, p.file_id, p.ord, p.kind, p.title, p.page_no, p.text, p.char_len, "
-            "       f.path AS source_path, f.filetype "
+            f"SELECT {_PARENT_WITH_FILE_COLS} "
             "FROM parents p JOIN files f ON f.id = p.file_id WHERE p.id = ?",
             (parent_id,),
         ).fetchone()
@@ -367,45 +399,22 @@ class Store:
 
     def parent_ids_for_chunks(self, chunk_ids: Iterator[int] | list[int]) -> dict[int, int]:
         """Batched chunk_id → parent_id lookup. Skips ids that don't exist."""
-        ids = list(chunk_ids)
-        if not ids:
-            return {}
-        conn = self.connect()
-        out: dict[int, int] = {}
-        # SQLite has a fixed parameter ceiling (default 999); chunk in case the
-        # caller hands us a very large list.
-        for start in range(0, len(ids), 500):
-            batch = ids[start:start + 500]
-            qmarks = ",".join("?" * len(batch))
-            rows = conn.execute(
-                f"SELECT id, parent_id FROM chunks WHERE id IN ({qmarks})", batch,
-            ).fetchall()
-            for r in rows:
-                out[r["id"]] = r["parent_id"]
-        return out
+        return self._select_in_batches(
+            list(chunk_ids),
+            "SELECT id, parent_id FROM chunks WHERE id IN ({qmarks})",
+            lambda r: (r["id"], r["parent_id"]),
+        )
 
     def get_parents(self, parent_ids: Iterator[int] | list[int]) -> dict[int, dict]:
         """Batched parent fetch. Returns {parent_id: row dict}, skipping
-        missing ids. Joins `files` so the source_path/filetype are populated."""
-        ids = list(parent_ids)
-        if not ids:
-            return {}
-        conn = self.connect()
-        out: dict[int, dict] = {}
-        for start in range(0, len(ids), 500):
-            batch = ids[start:start + 500]
-            qmarks = ",".join("?" * len(batch))
-            rows = conn.execute(
-                "SELECT p.id, p.file_id, p.ord, p.kind, p.title, p.page_no, "
-                "       p.text, p.char_len, "
-                "       f.path AS source_path, f.filetype "
-                f"FROM parents p JOIN files f ON f.id = p.file_id "
-                f"WHERE p.id IN ({qmarks})",
-                batch,
-            ).fetchall()
-            for r in rows:
-                out[r["id"]] = dict(r)
-        return out
+        missing ids. Joins `files` so source_path/filetype are populated."""
+        return self._select_in_batches(
+            list(parent_ids),
+            f"SELECT {_PARENT_WITH_FILE_COLS} "
+            "FROM parents p JOIN files f ON f.id = p.file_id "
+            "WHERE p.id IN ({qmarks})",
+            lambda r: (r["id"], dict(r)),
+        )
 
     def list_sources(self) -> list[dict]:
         conn = self.connect()
@@ -477,14 +486,14 @@ class Store:
             return data["embeddings"]
 
     def iter_bm25_texts_ordered(self) -> Iterator[str]:
-        """BM25 text per chunk in canonical (parent_id, ord) order.
+        """BM25 text per chunk in canonical order.
 
-        Prefers the contextual-composed text (Phase 2) when present, falls
-        back to raw chunk text. Used by the engine to rebuild BM25 from
-        SQLite at load time — see module docstring for why pickle is gone.
+        Prefers the contextual-composed text when present, falls back to raw
+        chunk text. Used by the engine to rebuild BM25 from SQLite at load
+        time — see module docstring for why pickle is gone.
         """
         conn = self.connect()
         for r in conn.execute(
-            "SELECT text, text_for_bm25 FROM chunks ORDER BY parent_id, ord"
+            f"SELECT text, text_for_bm25 FROM chunks {_CANONICAL_CHUNK_ORDER}"
         ):
             yield r["text_for_bm25"] or r["text"]

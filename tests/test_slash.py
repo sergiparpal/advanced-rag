@@ -5,7 +5,7 @@ from advanced_rag.slash import slash_rag
 
 
 def setup_function(_):
-    state_mod.invalidate_cache_for_tests()
+    state_mod.reset_for_tests()
 
 
 def test_empty_returns_status_and_help(tmp_data_dir):
@@ -19,7 +19,7 @@ def test_empty_returns_status_and_help(tmp_data_dir):
 
 def test_on_enables(tmp_data_dir):
     state_mod.set_ambient(False)
-    state_mod.invalidate_cache_for_tests()
+    state_mod.reset_for_tests()
     out = slash_rag("on")
     assert out == "Ambient RAG: on"
     assert state_mod.is_ambient_enabled() is True
@@ -27,7 +27,7 @@ def test_on_enables(tmp_data_dir):
 
 def test_off_disables(tmp_data_dir):
     state_mod.set_ambient(True)
-    state_mod.invalidate_cache_for_tests()
+    state_mod.reset_for_tests()
     out = slash_rag("off")
     assert out == "Ambient RAG: off"
     assert state_mod.is_ambient_enabled() is False

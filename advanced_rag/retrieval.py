@@ -7,13 +7,18 @@ one place is the only way to keep BM25 scoring honest.
 from __future__ import annotations
 
 import heapq
+import logging
 import re
+from collections import defaultdict
 from dataclasses import dataclass
+from operator import itemgetter
 from typing import Iterable
 
 import numpy as np
 
 from .config import RRF_K
+
+log = logging.getLogger(__name__)
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 
@@ -66,47 +71,58 @@ def rrf_fuse(rankings: list[list[int]], k: int = RRF_K) -> dict[int, float]:
     return fused
 
 
+def _top_k_descending(scores: np.ndarray, k: int) -> np.ndarray:
+    """Indices of the top-`k` entries in `scores`, descending. ``O(N)``
+    partial selection then a small sort over the head — the dense and BM25
+    top-k loops both ride this."""
+    n = scores.shape[0]
+    k = min(k, n)
+    if k <= 0:
+        return np.empty(0, dtype=np.int64)
+    idx = np.argpartition(-scores, k - 1)[:k]
+    return idx[np.argsort(-scores[idx])]
+
+
 def _bm25_topk(engine, query_tokens: list[str], k: int) -> list[int]:
-    if engine._bm25 is None or not query_tokens:
+    if engine.bm25 is None or not query_tokens:
         return []
-    scores = engine._bm25.get_scores(query_tokens)
+    scores = engine.bm25.get_scores(query_tokens)
     if len(scores) == 0:
         return []
-    k = min(k, len(scores))
-    if k <= 0:
-        return []
-    # argpartition is O(N), then sort the small head by exact score.
-    idx = np.argpartition(-scores, k - 1)[:k]
-    idx = idx[np.argsort(-scores[idx])]
-    return [engine._chunk_ids[i] for i in idx if scores[i] > 0]
+    idx = _top_k_descending(scores, k)
+    return [engine.chunk_ids[i] for i in idx if scores[i] > 0]
 
 
 def _dense_topk_from_vec(engine, qvec: np.ndarray, k: int) -> list[int]:
     """Dense top-k from a pre-computed query vector. Used by the ambient
     path so it can mix prior-turn embeddings into the query (convo memory)
-    before scoring against the corpus."""
-    if engine._embeddings is None or engine._embeddings.shape[0] == 0:
+    before scoring against the corpus.
+
+    `_check_consistency` already refuses to load a dim-mismatched index, so
+    a mismatch here means live state was corrupted mid-process. We log an
+    error and return [] rather than crash — the caller proceeds with BM25
+    only.
+    """
+    if engine.embeddings is None or engine.embeddings.shape[0] == 0:
         return []
     if qvec is None or qvec.size == 0 or qvec.ndim != 1:
         return []
-    if qvec.shape[0] != engine._embeddings.shape[1]:
-        # Dim drift between query and index — caller should reset; the safe
-        # behavior here is "no dense hits" rather than a noisy crash.
+    if qvec.shape[0] != engine.embeddings.shape[1]:
+        log.error(
+            "dense top-k aborted: query vector dim %d != index dim %d. "
+            "Engine consistency check should have caught this — investigate.",
+            qvec.shape[0], engine.embeddings.shape[1],
+        )
         return []
-    sims = engine._embeddings @ qvec
-    n = sims.shape[0]
-    k = min(k, n)
-    if k <= 0:
-        return []
-    idx = np.argpartition(-sims, k - 1)[:k]
-    idx = idx[np.argsort(-sims[idx])]
-    return [engine._chunk_ids[i] for i in idx]
+    sims = engine.embeddings @ qvec
+    idx = _top_k_descending(sims, k)
+    return [engine.chunk_ids[i] for i in idx]
 
 
 def _dense_topk(engine, query: str, k: int) -> list[int]:
-    if engine._embeddings is None or engine._embeddings.shape[0] == 0:
+    if engine.embeddings is None or engine.embeddings.shape[0] == 0:
         return []
-    qvec = engine._embedder.encode([query])  # (1, dim), L2-normalized
+    qvec = engine.embedder.encode([query])  # (1, dim), L2-normalized
     if qvec.shape[0] == 0:
         return []
     return _dense_topk_from_vec(engine, qvec[0], k)
@@ -144,9 +160,9 @@ def _materialize_hits(
         return []
     # heapq.nlargest is O(N log k); full sort is O(N log N). Cheap improvement
     # given `fused` can hold thousands of (chunk_id, score) pairs.
-    top = heapq.nlargest(k_pool, fused.items(), key=lambda kv: kv[1])
+    top = heapq.nlargest(k_pool, fused.items(), key=itemgetter(1))
     # One SQL roundtrip for the whole batch instead of N+1 per-chunk lookups.
-    parent_by_chunk = engine._store.parent_ids_for_chunks([cid for cid, _ in top])
+    parent_by_chunk = engine.store.parent_ids_for_chunks([cid for cid, _ in top])
     out: list[Hit] = []
     for cid, score in top:
         pid = parent_by_chunk.get(cid)
@@ -160,15 +176,14 @@ def chunks_to_parents(engine, hits: Iterable[Hit], top: int) -> list[ParentResul
     """MAX-rollup: a parent's score is the highest fused score across its
     matched chunks. (Avoids penalizing parents whose other children are
     unrelated, which SUM/MEAN would do.)"""
-    by_parent: dict[int, float] = {}
+    by_parent: dict[int, float] = defaultdict(lambda: float("-inf"))
     for h in hits:
-        prev = by_parent.get(h.parent_id)
-        if prev is None or h.score > prev:
+        if h.score > by_parent[h.parent_id]:
             by_parent[h.parent_id] = h.score
 
-    ranked = heapq.nlargest(top, by_parent.items(), key=lambda kv: kv[1])
+    ranked = heapq.nlargest(top, by_parent.items(), key=itemgetter(1))
     # Single batched fetch for all top parent rows.
-    parent_rows = engine._store.get_parents([pid for pid, _ in ranked])
+    parent_rows = engine.store.get_parents([pid for pid, _ in ranked])
     out: list[ParentResult] = []
     for pid, score in ranked:
         row = parent_rows.get(pid)
@@ -192,6 +207,14 @@ _AMBIENT_HEADER = (
     "to follow.]\n"
 )
 
+# Format-context truncation constants.
+# Below this many remaining chars, drop the partial block entirely rather
+# than emit a stub that's mostly closing tag.
+_MIN_TRUNCATED_BODY_CHARS = 300
+# Char budget reserved for the closing tag + the trailing "…" inside a
+# truncated block. Tracked here so the body-slice math reads clearly.
+_TRUNCATION_OVERHEAD_CHARS = 32
+
 
 def sanitize_document_text(text: str) -> str:
     """Defang our own closing wrapper so a hostile document can't break out.
@@ -209,6 +232,28 @@ def sanitize_document_text(text: str) -> str:
     return text.replace("</retrieved_document>", "</retrieved_document_>")
 
 
+def _build_block(parent: ParentResult) -> str:
+    title = parent.title or f"{parent.kind} (parent {parent.parent_id})"
+    safe_text = sanitize_document_text(parent.text)
+    return (
+        f"<retrieved_document source={parent.source_path!r} title={title!r}>\n"
+        f"{safe_text}\n"
+        f"</retrieved_document>\n"
+    )
+
+
+def _truncate_block(block: str, remaining_chars: int) -> str | None:
+    """Truncate a full block to fit in ``remaining_chars``, preserving the
+    opening tag and the closing tag. Returns None if the available space is
+    too small to be worth emitting a stub."""
+    if remaining_chars <= _MIN_TRUNCATED_BODY_CHARS:
+        return None
+    head, body = block.split("\n", 1)
+    body_budget = remaining_chars - len(head) - _TRUNCATION_OVERHEAD_CHARS
+    truncated_body = body[:body_budget].rstrip() + "…"
+    return head + "\n" + truncated_body + "\n</retrieved_document>\n"
+
+
 def format_context(parents: list[ParentResult], token_cap: int = 1500) -> str:
     """Pack parents into `<retrieved_document>` blocks, truncating by
     char-budget (~4 chars/token). Returns "" if nothing fits.
@@ -221,28 +266,19 @@ def format_context(parents: list[ParentResult], token_cap: int = 1500) -> str:
     char_budget = token_cap * 4
     pieces: list[str] = [_AMBIENT_HEADER]
     used = len(_AMBIENT_HEADER)
-    wrote_any = False
+    body_blocks = 0
     for p in parents:
-        title = p.title or f"{p.kind} (parent {p.parent_id})"
-        safe_text = sanitize_document_text(p.text)
-        block = (
-            f"<retrieved_document source={p.source_path!r} title={title!r}>\n"
-            f"{safe_text}\n"
-            f"</retrieved_document>\n"
-        )
-        if used + len(block) > char_budget:
-            remaining = char_budget - used
-            if remaining > 300:
-                head, body = block.split("\n", 1)
-                truncated_body = body[: remaining - len(head) - 32].rstrip() + "…"
-                pieces.append(
-                    head + "\n" + truncated_body + "\n</retrieved_document>\n"
-                )
-                wrote_any = True
-            break
-        pieces.append(block)
-        used += len(block) + 1
-        wrote_any = True
-    if not wrote_any:
+        block = _build_block(p)
+        if used + len(block) <= char_budget:
+            pieces.append(block)
+            used += len(block) + 1
+            body_blocks += 1
+            continue
+        truncated = _truncate_block(block, char_budget - used)
+        if truncated is not None:
+            pieces.append(truncated)
+            body_blocks += 1
+        break
+    if body_blocks == 0:
         return ""
     return "\n".join(pieces).strip()

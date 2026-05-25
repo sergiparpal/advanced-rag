@@ -1,7 +1,13 @@
 import numpy as np
 import pytest
 
-from advanced_rag.engine import EngineLoadError, RAGEngine, get_engine, set_engine_for_tests
+from advanced_rag.engine import (
+    EngineLoadError,
+    RAGEngine,
+    get_engine,
+    reset_for_tests,
+    set_engine_for_tests,
+)
 from advanced_rag.storage import Store
 
 
@@ -10,7 +16,7 @@ def _seed_chunks(store: Store, ids: list[int]) -> None:
     so iter_chunks_ordered yields rows in canonical order."""
     fid = store.bulk_insert_files([("/x.md", 0.0, 0, "h", "md", 0.0)])["/x.md"]
     pid = store.bulk_insert_parents([(fid, 0, "section", "T", None, "body", 4)])[0]
-    rows = [(pid, i, f"chunk-{i}", 0) for i in range(len(ids))]
+    rows = [(pid, i, f"chunk-{i}", 0, None, None, None) for i in range(len(ids))]
     actual_ids = store.bulk_insert_chunks(rows)
     # Force chunk ids to match what the caller wanted (bulk_insert assigns
     # autoincrement, so we patch via SQL).
@@ -23,18 +29,18 @@ def _seed_chunks(store: Store, ids: list[int]) -> None:
 
 
 def test_get_engine_is_singleton(tmp_data_dir):
-    set_engine_for_tests(None)
+    reset_for_tests()
     a = get_engine()
     b = get_engine()
     assert a is b
-    set_engine_for_tests(None)
+    reset_for_tests()
 
 
 def test_set_engine_for_tests_replaces_singleton(tmp_data_dir, stub_embedder):
     eng = RAGEngine(store=Store(), embedder=stub_embedder)
     set_engine_for_tests(eng)
     assert get_engine() is eng
-    set_engine_for_tests(None)
+    reset_for_tests()
 
 
 def test_ensure_loaded_reads_artifacts_once(tmp_data_dir, stub_embedder):

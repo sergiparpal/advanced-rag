@@ -11,6 +11,15 @@ from pathlib import Path
 DEFAULT_DATA_DIR = Path.home() / ".hermes" / "plugins" / "advanced-rag" / "data"
 
 
+def env_flag(name: str, default: bool = False) -> bool:
+    """Truthy parse of an env var. Treats `1/true/yes/on` (case-insensitive)
+    as True. Unset → ``default``."""
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
 def get_data_dir() -> Path:
     env = os.environ.get("HERMES_RAG_DATA_DIR")
     return Path(env) if env else DEFAULT_DATA_DIR
@@ -50,6 +59,13 @@ MAX_PDF_PAGE_CHARS = 200_000
 # assumption that it's boilerplate (a stray title line, frontmatter, etc.).
 PREAMBLE_MIN_CHARS = 200
 RRF_K = 60
+
+# `rag_search` funnel widths. The pool of chunks that survive the
+# second-level RRF before parent rollup, and the pool of parents fed into
+# the reranker.
+RAG_SEARCH_CHUNK_POOL = 30
+RAG_SEARCH_PARENT_POOL = 10
+
 AMBIENT_TOP_PARENTS = 3
 AMBIENT_TOKEN_CAP = 1500
 AMBIENT_SCORE_THRESHOLD = 0.25
@@ -94,7 +110,7 @@ RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 COHERE_RERANK_MODEL = "rerank-english-v3.0"
 
-# Contextual Retrieval (Phase 2) — opt-in via HERMES_RAG_CONTEXTUAL=1.
+# Contextual Retrieval — opt-in via HERMES_RAG_CONTEXTUAL=1.
 CONTEXTUAL_MAX_TOKENS = 150  # output cap for the prefix-generation LLM call
 # Per-parent thread pool for contextual prefix generation. Anthropic's prompt
 # cache is parent-scoped, so concurrent requests for chunks of the SAME parent
@@ -103,9 +119,7 @@ CONTEXTUAL_MAX_TOKENS = 150  # output cap for the prefix-generation LLM call
 # the rate limit; bump for tier 3+.
 CONTEXTUAL_CONCURRENCY = 4
 
-# CRAG-lite (Phase 4) — opt-in via HERMES_RAG_CRAG=1.
-
-# Ambient conversational memory (Phase 3) — opt-in via
+# Ambient conversational memory — opt-in via
 # HERMES_RAG_AMBIENT_CONVO_MEMORY=1. Weights apply to current/previous/older
 # user turn embeddings, normalized before mixing.
 AMBIENT_CONVO_MEMORY_WEIGHTS = (1.0, 0.25, 0.1)

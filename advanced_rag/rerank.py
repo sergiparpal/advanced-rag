@@ -1,10 +1,18 @@
 """Reranker. Tries Cohere first (if COHERE_API_KEY set), falls back to a local
 cross-encoder, falls back to identity. Failures never reach the caller.
+
+The two reranker entry points (`rerank` and `rerank_local`) are
+non-mutating: input parents are never modified in place. Each returned
+``ParentResult`` is a fresh copy carrying the new ``rerank_score`` — so a
+caller can rerank the same list with different scorers (A/B testing) and
+trust that the inputs aren't leaking state between calls.
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
+from operator import itemgetter
 
 from .config import COHERE_RERANK_MODEL, RERANK_MODEL
 from .retrieval import ParentResult
@@ -12,6 +20,16 @@ from .retrieval import ParentResult
 log = logging.getLogger(__name__)
 
 _CROSS = None  # module-level cache for the local cross-encoder
+
+
+def _scored(parent: ParentResult, score: float | None) -> ParentResult:
+    """Return a copy of ``parent`` with ``rerank_score`` set to ``score``.
+
+    `dataclasses.replace` is the non-mutating equivalent of
+    ``p.rerank_score = score`` — letting the reranker pipeline build a
+    fresh ordering without leaking state back into the caller's list.
+    """
+    return dataclasses.replace(parent, rerank_score=score)
 
 
 def _try_cohere(query: str, parents: list[ParentResult], top_k: int) -> list[ParentResult] | None:
@@ -41,9 +59,10 @@ def _try_cohere(query: str, parents: list[ParentResult], top_k: int) -> list[Par
             # would silently wrap around to index from the end of `parents`.
             if not isinstance(idx, int) or idx < 0 or idx >= len(parents):
                 continue
-            p = parents[idx]
-            p.rerank_score = float(score) if score is not None else None
-            ordered.append(p)
+            ordered.append(_scored(
+                parents[idx],
+                float(score) if score is not None else None,
+            ))
         return ordered
     except Exception as e:
         log.warning("Cohere rerank failed, falling back: %s", e)
@@ -58,12 +77,10 @@ def _try_local_cross_encoder(query: str, parents: list[ParentResult], top_k: int
             _CROSS = CrossEncoder(RERANK_MODEL)
         pairs = [(query, p.text[:2000]) for p in parents]
         scores = _CROSS.predict(pairs)
-        ranked = sorted(zip(parents, scores), key=lambda kv: -float(kv[1]))[:top_k]
-        out: list[ParentResult] = []
-        for p, s in ranked:
-            p.rerank_score = float(s)
-            out.append(p)
-        return out
+        ranked = sorted(
+            zip(parents, scores), key=itemgetter(1), reverse=True,
+        )[:top_k]
+        return [_scored(p, float(s)) for p, s in ranked]
     except Exception as e:
         log.warning("local cross-encoder rerank failed: %s", e)
         return None
@@ -72,11 +89,10 @@ def _try_local_cross_encoder(query: str, parents: list[ParentResult], top_k: int
 def rerank(query: str, parents: list[ParentResult], top_k: int) -> list[ParentResult]:
     """Rerank `parents` by relevance to `query` and return the top `top_k`.
 
-    **Mutates input.** The chosen reranker writes its score back onto each
-    returned ``ParentResult`` via ``p.rerank_score = ...``. Callers that need
-    to rerank the same list more than once (e.g. A/B testing models) should
-    pass copies; otherwise a stale ``rerank_score`` from the previous call
-    will leak into the next.
+    Non-mutating: returned ``ParentResult`` objects are fresh copies — the
+    input list and its elements are untouched. Callers running multiple
+    rerank passes (A/B model comparison) can pass the same list twice
+    without stale scores leaking across calls.
     """
     if not parents:
         return []
@@ -88,12 +104,13 @@ def rerank(query: str, parents: list[ParentResult], top_k: int) -> list[ParentRe
     local_out = _try_local_cross_encoder(query, parents, top_k)
     if local_out:
         return local_out
-    # identity fallback
-    return parents[:top_k]
+    # Identity fallback. Still return fresh copies so the contract holds
+    # uniformly — callers never get back the same object they passed in.
+    return [_scored(p, None) for p in parents[:top_k]]
 
 
 def rerank_local(query: str, parents: list[ParentResult], top_k: int) -> list[ParentResult]:
-    """Local-cross-encoder-only variant used by the **ambient** path (Phase 3).
+    """Local-cross-encoder-only variant used by the **ambient** path.
 
     Cohere is intentionally never called from the ambient path: a per-turn
     HTTP round-trip would defeat the purpose of the cheap injection layer.
@@ -105,7 +122,7 @@ def rerank_local(query: str, parents: list[ParentResult], top_k: int) -> list[Pa
     local_out = _try_local_cross_encoder(query, parents, top_k)
     if local_out:
         return local_out
-    return parents[:top_k]
+    return [_scored(p, None) for p in parents[:top_k]]
 
 
 def warm_local_cross_encoder() -> None:

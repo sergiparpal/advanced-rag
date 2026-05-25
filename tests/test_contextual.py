@@ -1,11 +1,11 @@
-"""Phase 2 — Contextual Retrieval.
+"""Contextual Retrieval.
 
 Covers:
-- HERMES_RAG_CONTEXTUAL default-off (new columns NULL, behavior matches v0.1).
+- HERMES_RAG_CONTEXTUAL default-off (contextual columns NULL).
 - Prompt caching: the parent block carries cache_control: ephemeral.
 - Anthropic error during indexing → contextual_prefix NULL for that chunk;
   the run completes.
-- Migrating an existing DB (Phase 1 schema) to Phase 2 columns is lazy.
+- Lazy migration of pre-existing DBs to the contextual columns.
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from advanced_rag import contextual
+from advanced_rag import _anthropic, contextual
 from advanced_rag.indexing import index_path
 from advanced_rag.storage import Store
 
@@ -25,9 +25,9 @@ FIXTURES = Path(__file__).parent / "fixtures" / "docs"
 
 @pytest.fixture(autouse=True)
 def _reset_contextual_client():
-    contextual._reset_client_for_tests()
+    _anthropic.reset_for_tests()
     yield
-    contextual._reset_client_for_tests()
+    _anthropic.reset_for_tests()
 
 
 # --- env-driven toggle ---
@@ -92,7 +92,7 @@ def _install_recording_anthropic(monkeypatch, text="this is the context"):
     mod.Anthropic = _Client
     monkeypatch.setitem(sys.modules, "anthropic", mod)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    contextual._reset_client_for_tests()
+    _anthropic.reset_for_tests()
     return recorder
 
 
@@ -133,7 +133,7 @@ def test_silent_failure_on_sdk_exception(monkeypatch):
     mod.Anthropic = _Client
     monkeypatch.setitem(sys.modules, "anthropic", mod)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
-    contextual._reset_client_for_tests()
+    _anthropic.reset_for_tests()
     assert contextual.generate_contextual_prefix("p", "c") is None
 
 
@@ -210,7 +210,7 @@ def test_anthropic_failure_during_indexing_does_not_abort(
     mod.Anthropic = _Client
     monkeypatch.setitem(sys.modules, "anthropic", mod)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
-    contextual._reset_client_for_tests()
+    _anthropic.reset_for_tests()
 
     docs = _stage(tmp_path)
     store = Store()
@@ -330,7 +330,7 @@ def test_contextual_generation_uses_thread_pool(
     mod.Anthropic = _Client
     monkeypatch.setitem(sys.modules, "anthropic", mod)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    contextual._reset_client_for_tests()
+    _anthropic.reset_for_tests()
 
     # Build a single doc whose parent will split into many chunks so the
     # thread pool has something to parallelize.

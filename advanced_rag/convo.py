@@ -1,4 +1,4 @@
-"""Ambient conversational memory (Phase 3, opt-in).
+"""Ambient conversational memory (opt-in).
 
 When `HERMES_RAG_AMBIENT_CONVO_MEMORY=1`, the ambient retrieval path mixes
 the current user turn's query embedding with the embeddings of the previous
@@ -14,12 +14,11 @@ persists across process restarts.
 """
 from __future__ import annotations
 
-import os
 import threading
 
 import numpy as np
 
-from .config import AMBIENT_CONVO_MEMORY_WEIGHTS
+from .config import AMBIENT_CONVO_MEMORY_WEIGHTS, env_flag
 
 _LOCK = threading.Lock()
 _RINGS: dict[str, list[np.ndarray]] = {}
@@ -27,8 +26,7 @@ _RING_SIZE = len(AMBIENT_CONVO_MEMORY_WEIGHTS)  # current + N priors
 
 
 def is_enabled() -> bool:
-    val = os.environ.get("HERMES_RAG_AMBIENT_CONVO_MEMORY", "").strip().lower()
-    return val in ("1", "true", "yes", "on")
+    return env_flag("HERMES_RAG_AMBIENT_CONVO_MEMORY")
 
 
 def push(session_id: str, vec: np.ndarray) -> None:

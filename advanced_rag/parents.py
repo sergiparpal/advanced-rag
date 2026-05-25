@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 from .config import MAX_PARENT_CHARS, MAX_PDF_PAGE_CHARS, PREAMBLE_MIN_CHARS
 
@@ -170,49 +171,65 @@ def _enforce_parent_cap(parents: list[Parent], max_chars: int = MAX_PARENT_CHARS
     return out
 
 
-def _split_oversized(parent: Parent, max_chars: int) -> list[Parent]:
-    text = parent.text
+# --- oversized-parent split: a three-tier cascade ------------------------
+
+
+def _greedy_pack(parts: Iterable[str], max_chars: int, joiner: str) -> list[str]:
+    """Greedy pack `parts` into pieces of ≤``max_chars``, joining adjacent
+    parts with ``joiner``. Single parts that already exceed ``max_chars``
+    are yielded as-is — the caller cascades to a finer boundary."""
     pieces: list[str] = []
-    paragraphs = _PARA_SPLIT_RE.split(text)
     buf = ""
-    for para in paragraphs:
-        candidate = (buf + ("\n\n" if buf else "") + para)
+    for part in parts:
+        candidate = buf + (joiner if buf else "") + part
         if len(candidate) <= max_chars:
             buf = candidate
         else:
             if buf:
                 pieces.append(buf)
-                buf = ""
-            if len(para) <= max_chars:
-                buf = para
-            else:
-                # paragraph itself too large: split on lines
-                line_buf = ""
-                for line in para.split("\n"):
-                    cand = (line_buf + ("\n" if line_buf else "") + line)
-                    if len(cand) <= max_chars:
-                        line_buf = cand
-                    else:
-                        if line_buf:
-                            pieces.append(line_buf)
-                        if len(line) <= max_chars:
-                            line_buf = line
-                        else:
-                            for i in range(0, len(line), max_chars):
-                                pieces.append(line[i : i + max_chars])
-                            line_buf = ""
-                if line_buf:
-                    buf = line_buf
+            buf = part
     if buf:
         pieces.append(buf)
+    return pieces
 
-    out: list[Parent] = []
-    for idx, piece in enumerate(pieces):
-        suffix = f" (part {idx + 1})" if len(pieces) > 1 else ""
-        out.append(Parent(
+
+def _hard_chunks(text: str, max_chars: int) -> list[str]:
+    """Final fallback: slice into fixed-size pieces. Used only when a single
+    line exceeds ``max_chars`` and there's no natural boundary left."""
+    return [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
+
+
+def _flatten(chunks_of_chunks: Iterable[list[str]]) -> list[str]:
+    return [c for group in chunks_of_chunks for c in group]
+
+
+def _split_oversized(parent: Parent, max_chars: int) -> list[Parent]:
+    """Tier 1: paragraph boundaries (``\\n\\s*\\n``).
+    Tier 2: if a packed piece still exceeds ``max_chars``, re-pack on lines.
+    Tier 3: if a single line still exceeds ``max_chars``, hard-chunk it.
+    """
+    by_para = _greedy_pack(_PARA_SPLIT_RE.split(parent.text), max_chars, "\n\n")
+    by_line = _flatten(
+        _greedy_pack(p.split("\n"), max_chars, "\n") if len(p) > max_chars else [p]
+        for p in by_para
+    )
+    pieces = _flatten(
+        _hard_chunks(p, max_chars) if len(p) > max_chars else [p]
+        for p in by_line
+    )
+    return _wrap_as_parts(parent, pieces)
+
+
+def _wrap_as_parts(parent: Parent, pieces: list[str]) -> list[Parent]:
+    """Wrap each piece as a Parent inheriting the original's metadata.
+    When the original carries a title, suffix each part with `(part N)`."""
+    suffixed = len(pieces) > 1
+    return [
+        Parent(
             kind=parent.kind,
-            title=(parent.title + suffix) if parent.title else parent.title,
+            title=(parent.title + f" (part {idx + 1})") if (parent.title and suffixed) else parent.title,
             text=piece,
             page_no=parent.page_no,
-        ))
-    return out
+        )
+        for idx, piece in enumerate(pieces)
+    ]

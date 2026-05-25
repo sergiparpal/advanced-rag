@@ -117,7 +117,7 @@ def test_session_warm_hook_spawns_background_thread(tmp_data_dir, monkeypatch):
     from advanced_rag import engine as engine_mod
 
     # Warm-up is one-shot per process; reset for an isolated test.
-    adapters._reset_warm_for_tests()
+    adapters.reset_for_tests()
 
     calls = {"ensure": 0}
 
@@ -145,7 +145,7 @@ def test_session_warm_hook_swallows_exceptions(monkeypatch):
     import threading
     from advanced_rag import engine as engine_mod
 
-    adapters._reset_warm_for_tests()
+    adapters.reset_for_tests()
 
     def _boom():
         raise RuntimeError("simulated MiniLM load failure")

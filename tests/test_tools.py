@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from advanced_rag.engine import RAGEngine, set_engine_for_tests
+from advanced_rag.engine import RAGEngine, reset_for_tests, set_engine_for_tests
 from advanced_rag.indexing import index_path
 from advanced_rag.storage import Store
 from advanced_rag.tools import (
@@ -34,7 +34,7 @@ def warmed_engine(tmp_data_dir, tmp_path, stub_embedder, monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("COHERE_API_KEY", raising=False)
     yield eng
-    set_engine_for_tests(None)
+    reset_for_tests()
 
 
 # ---------- rag_search ----------
@@ -75,7 +75,7 @@ def test_search_sanitizes_closing_wrapper_in_text(tmp_data_dir, tmp_path,
     index_path(docs, store=store, embedder=stub_embedder)
     eng = RAGEngine(store=store, embedder=stub_embedder)
     eng._ensure_loaded()
-    set_engine_for_tests(None)
+    reset_for_tests()
 
     out = tool_rag_search({"query": "hostile section operator"}, engine=eng)
     payload = json.loads(out)
@@ -176,7 +176,7 @@ def test_search_accepts_explicit_engine(tmp_data_dir, tmp_path, stub_embedder, m
     eng._ensure_loaded()
 
     # do NOT set the singleton — pass engine= explicitly
-    set_engine_for_tests(None)
+    reset_for_tests()
     out = tool_rag_search({"query": "quick brown fox"}, engine=eng)
     payload = json.loads(out)
     assert "results" in payload
