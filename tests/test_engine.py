@@ -106,6 +106,42 @@ def test_ensure_loaded_with_missing_artifacts(tmp_data_dir, stub_embedder):
     assert eng._chunk_ids == []
 
 
+def test_store_connection_survives_cross_thread_use(tmp_data_dir, stub_embedder):
+    """Regression: the engine singleton's Store opens its SQLite connection
+    in whichever thread first calls into it. In production that's the
+    ``on_session_start`` warm thread; subsequent tool calls and the
+    ``pre_llm_call`` hook run on the main thread. Python's sqlite3 default
+    (``check_same_thread=True``) would raise ProgrammingError on every
+    cross-thread call, silently breaking every RAG tool after session start.
+    """
+    import threading
+
+    store = Store()
+    _seed_chunks(store, [1, 2, 3])
+    arr = np.eye(3, 32, dtype=np.float32)
+    ArtifactStore(store.data_dir).save(arr)
+
+    eng = RAGEngine(store=store, embedder=stub_embedder)
+
+    bg_error: list[Exception] = []
+
+    def _bg():
+        try:
+            eng._ensure_loaded()  # opens the connection in this thread
+        except Exception as e:
+            bg_error.append(e)
+
+    t = threading.Thread(target=_bg)
+    t.start()
+    t.join(timeout=5.0)
+    assert not bg_error, f"warm-thread load raised: {bg_error[0]!r}"
+
+    # Now the main thread touches the same connection. Without the fix this
+    # raises sqlite3.ProgrammingError.
+    hits = eng.hybrid_search("chunk-0")
+    assert isinstance(hits, list)
+
+
 def test_consistency_check_rejects_embedding_chunk_mismatch(tmp_data_dir, stub_embedder):
     """Embeddings array with N rows but SQLite has M chunks (N != M) must
     refuse to load with a clear EngineLoadError, not crash later in retrieval."""

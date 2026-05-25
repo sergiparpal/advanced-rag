@@ -100,7 +100,15 @@ class Store:
     def connect(self) -> sqlite3.Connection:
         if self._conn is not None:
             return self._conn
-        conn = sqlite3.connect(str(self.db_path))
+        # `check_same_thread=False`: the engine singleton's connection is
+        # opened by whichever thread first calls into the store — typically
+        # the `on_session_start` warm thread — and then reused from the
+        # main thread on every tool call and pre_llm_call hook. SQLite
+        # itself is thread-safe; Python's default thread-affinity check
+        # would otherwise raise ProgrammingError on every cross-thread use.
+        # Writes in this codebase are confined to the indexing path (a
+        # separate CLI process), so we don't need additional locking here.
+        conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
         self.init_schema(conn)
