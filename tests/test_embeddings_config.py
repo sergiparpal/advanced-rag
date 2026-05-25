@@ -11,7 +11,7 @@ import types
 import numpy as np
 import pytest
 
-from advanced_rag import config
+from advanced_rag import embeddings as embeddings_mod
 from advanced_rag.embeddings import Embedder
 from advanced_rag.engine import EngineLoadError, RAGEngine
 from advanced_rag.indexing import index_path
@@ -22,7 +22,7 @@ from advanced_rag.storage import Store
 
 def test_default_model_is_bge_m3(monkeypatch):
     monkeypatch.delenv("HERMES_RAG_EMBED_MODEL", raising=False)
-    assert config.get_embed_model() == "BAAI/bge-m3"
+    assert embeddings_mod.get_embed_model() == "BAAI/bge-m3"
     e = Embedder()
     assert e.model_name == "BAAI/bge-m3"
 
@@ -30,7 +30,7 @@ def test_default_model_is_bge_m3(monkeypatch):
 def test_env_overrides_model(monkeypatch):
     monkeypatch.setenv("HERMES_RAG_EMBED_MODEL",
                        "sentence-transformers/all-MiniLM-L6-v2")
-    assert (config.get_embed_model()
+    assert (embeddings_mod.get_embed_model()
             == "sentence-transformers/all-MiniLM-L6-v2")
     e = Embedder()
     assert e.model_name == "sentence-transformers/all-MiniLM-L6-v2"
@@ -38,12 +38,12 @@ def test_env_overrides_model(monkeypatch):
 
 def test_dim_env_override(monkeypatch):
     monkeypatch.setenv("HERMES_RAG_EMBED_DIM", "768")
-    assert config.get_embed_dim() == 768
+    assert embeddings_mod.get_embed_dim() == 768
 
 
 def test_dim_env_invalid_returns_none(monkeypatch):
     monkeypatch.setenv("HERMES_RAG_EMBED_DIM", "not-a-number")
-    assert config.get_embed_dim() is None
+    assert embeddings_mod.get_embed_dim() is None
 
 
 def test_known_models_have_known_dims():
@@ -51,7 +51,7 @@ def test_known_models_have_known_dims():
     # answer dim without loading the model — guard it explicitly.
     for known in ("BAAI/bge-m3", "all-MiniLM-L6-v2",
                   "sentence-transformers/all-MiniLM-L6-v2"):
-        assert known in config.EMBED_MODEL_DIMS
+        assert known in embeddings_mod.EMBED_MODEL_DIMS
 
 
 # --- auto-detect dim on unknown model ---

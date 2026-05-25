@@ -7,7 +7,7 @@ import json
 import logging
 
 from . import _anthropic
-from .config import ANTHROPIC_MODEL
+from ._anthropic import ANTHROPIC_MODEL
 
 log = logging.getLogger(__name__)
 

@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 
+from advanced_rag.artifacts import ArtifactStore
 from advanced_rag.engine import (
     EngineLoadError,
     RAGEngine,
@@ -47,15 +48,15 @@ def test_ensure_loaded_reads_artifacts_once(tmp_data_dir, stub_embedder):
     """First _ensure_loaded() loads the .npz and rebuilds BM25 from SQLite;
     reset() drops cached state; the next call rebuilds again."""
     store = Store()
-    arr = np.eye(3, 4, dtype=np.float32)
+    arr = np.eye(3, 32, dtype=np.float32)
     chunk_ids = [10, 20, 30]
     _seed_chunks(store, chunk_ids)
-    store.save_embeddings(store.npz_path, arr)
+    ArtifactStore(store.data_dir).save(arr)
 
     eng = RAGEngine(store=store, embedder=stub_embedder)
     eng._ensure_loaded()
     assert eng._chunk_ids == chunk_ids
-    assert eng._embeddings.shape == (3, 4)
+    assert eng._embeddings.shape == (3, 32)
     # BM25 came from SQLite, not a pickle on disk — corpus_size must reflect
     # the live chunks count.
     assert eng._bm25 is not None
@@ -82,12 +83,14 @@ def test_ensure_loaded_does_not_open_bm25_pickle(tmp_data_dir, stub_embedder):
     store = Store()
     chunk_ids = [1, 2, 3]
     _seed_chunks(store, chunk_ids)
-    arr = np.eye(3, 4, dtype=np.float32)
-    store.save_embeddings(store.npz_path, arr)
+    arr = np.eye(3, 32, dtype=np.float32)
+    ArtifactStore(store.data_dir).save(arr)
     # Plant a poisoned pickle: invalid bytes that would crash pickle.load if
     # anyone tried to deserialize it. If the engine reaches into it we'll
     # see an exception here.
-    store.bm25_path.write_bytes(b"\x80\x04this-is-not-a-pickle")
+    ArtifactStore(store.data_dir).legacy_bm25_path.write_bytes(
+        b"\x80\x04this-is-not-a-pickle"
+    )
 
     eng = RAGEngine(store=store, embedder=stub_embedder)
     eng._ensure_loaded()  # must not raise
@@ -109,7 +112,7 @@ def test_consistency_check_rejects_embedding_chunk_mismatch(tmp_data_dir, stub_e
     store = Store()
     _seed_chunks(store, [1, 2, 3])  # SQLite has 3 chunks
     arr = np.eye(5, 4, dtype=np.float32)  # but .npz has 5 rows
-    store.save_embeddings(store.npz_path, arr)
+    ArtifactStore(store.data_dir).save(arr)
 
     eng = RAGEngine(store=store, embedder=stub_embedder)
     with pytest.raises(EngineLoadError, match="3 chunks"):

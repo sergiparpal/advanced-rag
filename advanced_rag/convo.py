@@ -18,7 +18,11 @@ import threading
 
 import numpy as np
 
-from .config import AMBIENT_CONVO_MEMORY_WEIGHTS, env_flag
+from .config import env_flag
+
+# Weights apply to current/previous/older user turn embeddings, normalized
+# before mixing. Owned here because this module is the only consumer.
+AMBIENT_CONVO_MEMORY_WEIGHTS = (1.0, 0.25, 0.1)
 
 _LOCK = threading.Lock()
 _RINGS: dict[str, list[np.ndarray]] = {}

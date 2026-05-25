@@ -113,7 +113,9 @@ def make_session_warm_hook():
         def _bg():
             from .engine import get_engine
             from .rerank import warm_local_cross_encoder
-            _safe("session warm-up", lambda: get_engine()._ensure_loaded())
+            # has_embeddings() triggers the lazy load. Idempotent — a no-op
+            # if another caller already loaded.
+            _safe("session warm-up", lambda: get_engine().has_embeddings())
             _safe("cross-encoder warm-up", warm_local_cross_encoder)
 
         threading.Thread(target=_bg, daemon=True).start()

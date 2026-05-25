@@ -27,13 +27,22 @@ class StubEmbedder:
 
     Each token contributes a positional component; the result is L2-normalized.
     Two texts sharing tokens get higher cosine similarity than disjoint pairs,
-    which is enough to exercise the retrieval pipeline.
+    which is enough to exercise the retrieval pipeline. Conforms structurally
+    to ``EmbedderProtocol``.
     """
 
     DIM = 32
 
     def __init__(self, model_name: str = "stub"):
         self._model_name = model_name
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
+    @property
+    def dim(self) -> int:
+        return self.DIM
 
     def encode(self, texts, batch_size: int = 64) -> np.ndarray:
         out = np.zeros((len(texts), self.DIM), dtype=np.float32)

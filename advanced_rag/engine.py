@@ -1,16 +1,22 @@
 """Process-wide RAG engine. Holds the (lazily loaded) BM25, embeddings array,
-chunk_id list, embedder, and store. `reset()` drops cached state so a re-index
-flushes the next query.
+chunk_id list, embedder, and store, and exposes ``hybrid_search`` as the
+public retrieval entry point. Callers never reach into ``_bm25`` /
+``_embeddings`` directly — they go through the method, which folds the
+lazy-load behind the public surface.
 
 BM25 is rebuilt from SQLite at load time rather than read from a pickle —
-see `storage.py` module docstring for the security reasoning.
+see ``storage.py`` module docstring for the security reasoning.
 """
 from __future__ import annotations
 
 import logging
 import threading
 
-from .config import npz_path
+import numpy as np
+
+from . import validation
+from .artifacts import ArtifactStore
+from .models import Hit
 from .storage import Store
 
 log = logging.getLogger(__name__)
@@ -19,12 +25,9 @@ _INSTANCE = None
 _INSTANCE_LOCK = threading.Lock()
 
 
-class EngineLoadError(RuntimeError):
-    """Raised when the on-disk index artifacts are inconsistent. Surfaces a
-    partial-failure scenario (e.g. .npz updated but bm25.pkl stale, or
-    embed_row drift) instead of letting it manifest as a silent IndexError
-    deep inside retrieval.
-    """
+# Backwards-compatible alias: tests and downstream code import this name
+# from ``engine``. Internally it's just the validation module's error type.
+EngineLoadError = validation.IndexConsistencyError
 
 
 class RAGEngine:
@@ -32,21 +35,75 @@ class RAGEngine:
         self._store = store or Store()
         self._embedder = embedder
         self._bm25 = None
-        self._embeddings = None
+        self._embeddings: np.ndarray | None = None
         self._chunk_ids: list[int] = []
         self._loaded = False
+        # The index version that was on disk the last time we loaded. A
+        # reindex bumps the meta key; the next call sees the mismatch and
+        # transparently reloads — no caller has to invoke `reset()`.
+        self._loaded_version: str | None = None
         self._lock = threading.Lock()
 
-    # --- public read-only views over the loaded state ---
-    #
-    # Sibling modules (`retrieval`, `hooks`) read these to score queries.
-    # Properties (vs raw attribute access) declare the access boundary and
-    # let us swap the backing store later (e.g. memmap) without touching
-    # every caller.
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     @property
     def store(self) -> Store:
         return self._store
+
+    def hybrid_search(
+        self,
+        query: str,
+        *,
+        qvec: np.ndarray | None = None,
+        k_pool: int = 30,
+    ) -> list[Hit]:
+        """BM25 + dense top-k fused with RRF. Lazy-loads on first call so
+        callers never need to invoke ``_ensure_loaded`` themselves.
+
+        ``qvec`` is the optional pre-computed query vector — supplied by the
+        ambient path when convo memory mixes the current query embedding with
+        prior turns. When ``None``, the configured embedder encodes ``query``.
+        BM25 always operates on the literal ``query`` regardless, so lexical
+        search isn't contaminated by mixed embeddings.
+        """
+        # Local import to avoid a top-level cycle. retrieval reuses our
+        # internals via `engine_like.bm25/embeddings/chunk_ids/...`.
+        from .retrieval import hybrid_search as _retrieval_hybrid_search
+
+        self._ensure_loaded()
+        return _retrieval_hybrid_search(self, query, qvec=qvec, k_pool=k_pool)
+
+    def encode_query(self, query: str) -> np.ndarray | None:
+        """Encode `query` to a single L2-normalized vector, or None if the
+        embedder returned empty. Used by the ambient path's convo-memory
+        mixer."""
+        self._ensure_loaded()
+        if self._embedder is None:
+            return None
+        batch = self._embedder.encode([query])
+        if batch.shape[0] == 0:
+            return None
+        return batch[0]
+
+    def has_embeddings(self) -> bool:
+        """True iff there's at least one row available to score against."""
+        self._ensure_loaded()
+        return self._embeddings is not None and self._embeddings.shape[0] > 0
+
+    def reset(self) -> None:
+        with self._lock:
+            self._bm25 = None
+            self._embeddings = None
+            self._chunk_ids = []
+            self._loaded = False
+            self._loaded_version = None
+
+    # ------------------------------------------------------------------
+    # Read-only views — used by retrieval.py to score queries. These are
+    # protocol surface, not a free invitation to mutate engine state.
+    # ------------------------------------------------------------------
 
     @property
     def embedder(self):
@@ -64,23 +121,32 @@ class RAGEngine:
     def bm25(self):
         return self._bm25
 
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
     def _make_default_embedder(self):
         from .embeddings import Embedder
         return Embedder()
 
     def _ensure_loaded(self) -> None:
-        if self._loaded:
+        # Fast path: already loaded AND the on-disk version still matches.
+        # The meta read is one tiny SELECT — sub-millisecond — and lets
+        # indexing invalidate by writing the meta key instead of calling
+        # back into engine.reset() (which would couple the two modules).
+        current_version = self._store.get_meta("index_version")
+        if self._loaded and current_version == self._loaded_version:
             return
         with self._lock:
-            if self._loaded:
+            current_version = self._store.get_meta("index_version")
+            if self._loaded and current_version == self._loaded_version:
                 return
             if self._embedder is None:
                 self._embedder = self._make_default_embedder()
 
-            npz_p = npz_path(self._store.data_dir)
-
-            if npz_p.exists():
-                self._embeddings = self._store.load_embeddings(npz_p)
+            artifacts = ArtifactStore(self._store.data_dir)
+            if artifacts.exists():
+                self._embeddings = artifacts.load()
                 self._chunk_ids = self._store.get_chunk_ids_ordered()
                 self._bm25 = self._build_bm25()
             else:
@@ -88,12 +154,23 @@ class RAGEngine:
                 self._chunk_ids = []
                 self._bm25 = None
 
-            self._check_consistency()
+            try:
+                validation.validate(
+                    self._embeddings, self._chunk_ids, self._store, self._embedder,
+                )
+            except validation.IndexConsistencyError:
+                self._embeddings = None
+                self._chunk_ids = []
+                self._bm25 = None
+                self._loaded = False
+                self._loaded_version = None
+                raise
             self._loaded = True
+            self._loaded_version = current_version
 
     def _build_bm25(self):
         """Build BM25Okapi from the SQLite chunks table. Returns None for an
-        empty corpus. Identical tokenizer to query time — `retrieval._tokenize`
+        empty corpus. Identical tokenizer to query time — ``retrieval._tokenize``
         is the single source so index- and query-side tokens stay aligned.
         """
         from rank_bm25 import BM25Okapi
@@ -104,92 +181,6 @@ class RAGEngine:
         if not tokenized:
             return None
         return BM25Okapi(tokenized)
-
-    def _invalidate_and_raise(self, message: str) -> None:
-        """Scrub the loaded state and raise ``EngineLoadError``. Centralises
-        the three-line reset that every consistency check would otherwise
-        copy-paste."""
-        self._embeddings = None
-        self._chunk_ids = []
-        self._bm25 = None
-        raise EngineLoadError(message)
-
-    def _check_consistency(self) -> None:
-        """Refuse to serve queries if the loaded artifacts disagree about
-        cardinality or model identity. A partial rebuild can leave .npz and
-        the SQLite chunks table in inconsistent states; catching that here
-        is much better than letting it surface as an IndexError deep in
-        retrieval.
-        """
-        if self._embeddings is None:
-            return
-        self._check_cardinality()
-        self._check_disk_dim()
-        self._check_configured_dim()
-        self._check_model_drift()
-
-    def _check_cardinality(self) -> None:
-        n_emb = int(self._embeddings.shape[0])
-        n_ids = len(self._chunk_ids)
-        if n_emb != n_ids:
-            self._invalidate_and_raise(
-                f"embeddings array has {n_emb} rows but SQLite has "
-                f"{n_ids} chunks — re-run `hermes rag index <path> --force`."
-            )
-
-    def _check_disk_dim(self) -> None:
-        """Catch the silent corruption case where the .npz was built with a
-        different model than the currently configured one."""
-        on_disk_dim = self._store.get_meta("embed_dim")
-        if on_disk_dim is None:
-            return
-        try:
-            disk_dim = int(on_disk_dim)
-        except ValueError:
-            return
-        live_dim = int(self._embeddings.shape[1])
-        if disk_dim != live_dim:
-            self._invalidate_and_raise(
-                f"embeddings.npz dim {live_dim} disagrees with stored "
-                f"meta dim {disk_dim} — re-run "
-                "`hermes rag index <path> --force`."
-            )
-
-    def _check_configured_dim(self) -> None:
-        configured_dim = getattr(self._embedder, "dim", None)
-        if not configured_dim:
-            return
-        live_dim = int(self._embeddings.shape[1])
-        if configured_dim != live_dim:
-            self._invalidate_and_raise(
-                f"configured embedder dim {configured_dim} disagrees with "
-                f".npz dim {live_dim} — re-run "
-                "`hermes rag index <path> --force` "
-                "(or unset HERMES_RAG_EMBED_MODEL / HERMES_RAG_EMBED_DIM)."
-            )
-
-    def _check_model_drift(self) -> None:
-        """Dim matches but the model name doesn't — quality may degrade.
-        Loud, but non-fatal: we still serve queries."""
-        on_disk_model = self._store.get_meta("embed_model")
-        configured_model = getattr(self._embedder, "model_name", None) or getattr(
-            self._embedder, "_model_name", None
-        )
-        if on_disk_model and configured_model and on_disk_model != configured_model:
-            log.warning(
-                "embedding-model drift: index was built with %r but the "
-                "current configuration is %r. Dimensions match so retrieval "
-                "will still run, but quality may degrade until a "
-                "`hermes rag index --force` rebuilds the .npz.",
-                on_disk_model, configured_model,
-            )
-
-    def reset(self) -> None:
-        with self._lock:
-            self._bm25 = None
-            self._embeddings = None
-            self._chunk_ids = []
-            self._loaded = False
 
 
 def get_engine() -> RAGEngine:

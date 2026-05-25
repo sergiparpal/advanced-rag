@@ -16,7 +16,17 @@ from __future__ import annotations
 import logging
 
 from . import _anthropic
-from .config import ANTHROPIC_MODEL, CONTEXTUAL_MAX_TOKENS, env_flag
+from ._anthropic import ANTHROPIC_MODEL
+from .config import env_flag
+
+# Output cap for the prefix-generation LLM call.
+CONTEXTUAL_MAX_TOKENS = 150
+# Per-parent thread pool for contextual prefix generation. Anthropic's prompt
+# cache is parent-scoped, so concurrent requests for chunks of the SAME parent
+# all hit the same cache entry — concurrency multiplies throughput without
+# multiplying token cost. Conservative default keeps tier-1 API users under
+# the rate limit; bump for tier 3+.
+CONTEXTUAL_CONCURRENCY = 4
 
 log = logging.getLogger(__name__)
 

@@ -2,6 +2,7 @@ from pathlib import Path
 
 import numpy as np
 
+from advanced_rag.artifacts import ArtifactStore
 from advanced_rag.indexing import index_path
 from advanced_rag.storage import Store
 
@@ -20,15 +21,16 @@ def _stage(tmp_path: Path) -> Path:
 def test_index_path_creates_artifacts(tmp_data_dir, tmp_path, stub_embedder):
     docs = _stage(tmp_path)
     store = Store()
+    arts = ArtifactStore(store.data_dir)
     summary = index_path(docs, store=store, embedder=stub_embedder)
     assert summary["files_added_or_updated"] == 3
     assert summary["parents"] >= 3
     assert summary["chunks"] >= 3
-    assert store.npz_path.exists()
+    assert arts.exists()
     # BM25 is no longer persisted — it's rebuilt from SQLite on engine load.
     # Any bm25.pkl on disk would be either a stale legacy file or a planted
     # one; either way, indexing must leave none behind.
-    assert not store.bm25_path.exists()
+    assert not arts.legacy_bm25_path.exists()
 
 
 def test_index_unlinks_legacy_bm25_pickle(tmp_data_dir, tmp_path, stub_embedder):
@@ -37,13 +39,14 @@ def test_index_unlinks_legacy_bm25_pickle(tmp_data_dir, tmp_path, stub_embedder)
     index so it can never be loaded by a future code path."""
     docs = _stage(tmp_path)
     store = Store()
+    arts = ArtifactStore(store.data_dir)
     # Plant a pickle file before indexing.
-    store.bm25_path.parent.mkdir(parents=True, exist_ok=True)
-    store.bm25_path.write_bytes(b"\x80\x04this-should-be-removed")
-    assert store.bm25_path.exists()
+    arts.legacy_bm25_path.parent.mkdir(parents=True, exist_ok=True)
+    arts.legacy_bm25_path.write_bytes(b"\x80\x04this-should-be-removed")
+    assert arts.legacy_bm25_path.exists()
 
     index_path(docs, store=store, embedder=stub_embedder)
-    assert not store.bm25_path.exists()
+    assert not arts.legacy_bm25_path.exists()
 
 
 def test_walk_skips_symlinks(tmp_data_dir, tmp_path, stub_embedder):
@@ -198,7 +201,7 @@ def test_embed_row_invariant(tmp_data_dir, tmp_path, stub_embedder):
     store = Store()
     index_path(docs, store=store, embedder=stub_embedder)
 
-    embeddings = store.load_embeddings(store.npz_path)
+    embeddings = ArtifactStore(store.data_dir).load()
     rows = list(store.iter_chunks_ordered())
     assert embeddings.shape[0] == len(rows)
     # embed_row column in SQLite must match the row index it occupies — this
@@ -222,50 +225,51 @@ def test_engine_chunk_ids_match_canonical_order(tmp_data_dir, tmp_path, stub_emb
     assert eng._embeddings.shape[0] == len(canonical)
 
 
-def test_index_with_explicit_store_does_not_reset_singleton(
-    tmp_data_dir, tmp_path, stub_embedder, monkeypatch,
+def test_indexing_bumps_index_version_meta(tmp_data_dir, tmp_path, stub_embedder):
+    """After a rebuild, the `index_version` meta key changes. The engine's
+    `_ensure_loaded` reads this key on every call and reloads on mismatch —
+    so any future writer (incremental update, online ingestion) invalidates
+    cached engine state by construction, no explicit `engine.reset()` call
+    needed."""
+    docs = _stage(tmp_path)
+    store = Store()
+    index_path(docs, store=store, embedder=stub_embedder)
+    v1 = store.get_meta("index_version")
+    assert v1 is not None
+
+    # Touch one source file so it's reindexed and the version bumps.
+    (docs / "a.md").write_text("# Alpha\n\n## changed\nupdated body.")
+    index_path(docs, store=store, embedder=stub_embedder)
+    v2 = store.get_meta("index_version")
+    assert v2 is not None
+    assert v2 != v1, "index_version meta must change across reindex runs"
+
+
+def test_engine_reloads_on_index_version_change(
+    tmp_data_dir, tmp_path, stub_embedder,
 ):
-    """When the caller supplies an explicit store=, the process-wide engine
-    singleton is bound to a different data_dir; resetting it would force
-    an unrelated cold reload on the next ambient call."""
-    from advanced_rag import engine as engine_mod
-
-    reset_called = {"n": 0}
-
-    class _Spy:
-        def reset(self):
-            reset_called["n"] += 1
-
-    monkeypatch.setattr(engine_mod, "get_engine", lambda: _Spy())
+    """End-to-end: an engine that loaded against version V1 transparently
+    reloads on the next call once the store advances to V2 — without anyone
+    calling `engine.reset()`."""
+    from advanced_rag.engine import RAGEngine
 
     docs = _stage(tmp_path)
     store = Store()
     index_path(docs, store=store, embedder=stub_embedder)
-    assert reset_called["n"] == 0
 
+    eng = RAGEngine(store=store, embedder=stub_embedder)
+    eng._ensure_loaded()
+    first_ids = list(eng._chunk_ids)
+    assert first_ids, "expected at least one chunk after the first index pass"
+    first_version = eng._loaded_version
 
-def test_index_without_explicit_store_resets_singleton(
-    tmp_data_dir, tmp_path, stub_embedder, monkeypatch,
-):
-    """When the caller omits store=, index_path owns the Store and is
-    expected to flush the singleton's cached artifacts."""
-    from advanced_rag import engine as engine_mod
-    # Make sure index_path won't actually try to load a real Embedder.
-    import advanced_rag.indexing as indexing_mod
-    monkeypatch.setattr(indexing_mod, "rebuild_artifacts", lambda *a, **kw: None)
+    # Add a brand-new file. Force a fresh re-extract so chunk ids differ.
+    (docs / "c.md").write_text("# Gamma\n\n## newsec\nbrand new body.")
+    index_path(docs, store=store, embedder=stub_embedder)
 
-    reset_called = {"n": 0}
-
-    class _Spy:
-        def reset(self):
-            reset_called["n"] += 1
-
-    monkeypatch.setattr(engine_mod, "get_engine", lambda: _Spy())
-
-    docs = _stage(tmp_path)
-    # Bypass Embedder construction by passing stub explicitly.
-    index_path(docs, embedder=stub_embedder)
-    assert reset_called["n"] == 1
+    eng._ensure_loaded()
+    assert eng._loaded_version != first_version
+    assert len(eng._chunk_ids) > len(first_ids)
 
 
 def test_indexing_failure_warning_goes_to_stderr(

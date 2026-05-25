@@ -122,8 +122,9 @@ def test_session_warm_hook_spawns_background_thread(tmp_data_dir, monkeypatch):
     calls = {"ensure": 0}
 
     class _StubEngine:
-        def _ensure_loaded(self):
+        def has_embeddings(self):
             calls["ensure"] += 1
+            return False
 
     monkeypatch.setattr(engine_mod, "get_engine", lambda: _StubEngine())
 
@@ -151,7 +152,7 @@ def test_session_warm_hook_swallows_exceptions(monkeypatch):
         raise RuntimeError("simulated MiniLM load failure")
 
     class _Boom:
-        def _ensure_loaded(self):
+        def has_embeddings(self):
             _boom()
 
     monkeypatch.setattr(engine_mod, "get_engine", lambda: _Boom())

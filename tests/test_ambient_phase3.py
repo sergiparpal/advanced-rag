@@ -17,6 +17,7 @@ import pytest
 
 import advanced_rag.convo as convo_mod
 import advanced_rag.hooks as hooks_mod
+import advanced_rag.pipelines as pipelines_mod
 import advanced_rag.rerank as rerank_mod
 import advanced_rag.state as state_mod
 from advanced_rag.engine import RAGEngine, reset_for_tests, set_engine_for_tests
@@ -55,7 +56,7 @@ def warmed_engine(tmp_data_dir, tmp_path, stub_embedder):
 
 def test_ambient_runs_local_rerank(warmed_engine, monkeypatch, mock_cross_encoder):
     """Drop the threshold to 0 and verify the cross-encoder is invoked."""
-    monkeypatch.setattr(hooks_mod, "AMBIENT_SCORE_THRESHOLD", 0.0)
+    monkeypatch.setattr(pipelines_mod, "AMBIENT_SCORE_THRESHOLD", 0.0)
     mock_cross_encoder._scores = [10.0, 5.0, 1.0, 0.5, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0]
 
     out = ambient_pre_llm_call(
@@ -71,8 +72,8 @@ def test_ambient_narrows_from_top10_to_top3(warmed_engine, monkeypatch,
     """The pipeline hands `AMBIENT_RERANK_POOL` (=10) parents to the local
     cross-encoder, and the reranker returns at most `AMBIENT_TOP_PARENTS`
     (=3). Verify by spying on the pair count fed into `predict`."""
-    monkeypatch.setattr(hooks_mod, "AMBIENT_SCORE_THRESHOLD", 0.0)
-    monkeypatch.setattr(hooks_mod, "AMBIENT_TOP_PARENTS", 3)
+    monkeypatch.setattr(pipelines_mod, "AMBIENT_SCORE_THRESHOLD", 0.0)
+    monkeypatch.setattr(pipelines_mod, "AMBIENT_TOP_PARENTS", 3)
 
     seen_pair_counts: list[int] = []
     real_predict = mock_cross_encoder.CrossEncoder("x").predict
@@ -107,7 +108,7 @@ def test_ambient_never_calls_cohere(warmed_engine, monkeypatch,
                                     mock_cohere, mock_cross_encoder):
     """With COHERE_API_KEY set and a working Cohere mock, the ambient path
     must still go straight to the local cross-encoder."""
-    monkeypatch.setattr(hooks_mod, "AMBIENT_SCORE_THRESHOLD", 0.0)
+    monkeypatch.setattr(pipelines_mod, "AMBIENT_SCORE_THRESHOLD", 0.0)
 
     cohere_calls = {"n": 0}
     real_client = mock_cohere.Client
@@ -192,10 +193,7 @@ def test_convo_ring_buffer_holds_last_n(monkeypatch):
     convo_mod.push("sid", np.array([0.5, 0.5], dtype=np.float32))
     ring = convo_mod.get_ring("sid")
     # Buffer size matches the weights tuple length.
-    assert len(ring) == len(
-        __import__("advanced_rag.config", fromlist=["x"])
-        .AMBIENT_CONVO_MEMORY_WEIGHTS
-    )
+    assert len(ring) == len(convo_mod.AMBIENT_CONVO_MEMORY_WEIGHTS)
     # Newest first.
     assert np.allclose(ring[0], [0.5, 0.5])
 
@@ -226,17 +224,18 @@ def test_ambient_convo_memory_path_used_when_enabled(
     warmed_engine, monkeypatch, mock_cross_encoder,
 ):
     monkeypatch.setenv("HERMES_RAG_AMBIENT_CONVO_MEMORY", "1")
-    monkeypatch.setattr(hooks_mod, "AMBIENT_SCORE_THRESHOLD", 0.0)
+    monkeypatch.setattr(pipelines_mod, "AMBIENT_SCORE_THRESHOLD", 0.0)
     mock_cross_encoder._scores = [5.0, 1.0, 0.5, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
     seen = {"vec_path": False}
-    real = hooks_mod.retrieval.hybrid_search_with_vec
+    real = warmed_engine.hybrid_search
 
-    def spy(*a, **kw):
-        seen["vec_path"] = True
-        return real(*a, **kw)
+    def spy(query, *, qvec=None, k_pool=30):
+        if qvec is not None:
+            seen["vec_path"] = True
+        return real(query, qvec=qvec, k_pool=k_pool)
 
-    monkeypatch.setattr(hooks_mod.retrieval, "hybrid_search_with_vec", spy)
+    monkeypatch.setattr(warmed_engine, "hybrid_search", spy)
 
     ambient_pre_llm_call(
         session_id="conv-1", user_message="cosmic rays particles",
@@ -254,23 +253,20 @@ def test_ambient_convo_memory_falls_back_when_encode_returns_empty(
     pathological model), the convo path must fall back to the literal
     hybrid_search rather than crash."""
     monkeypatch.setenv("HERMES_RAG_AMBIENT_CONVO_MEMORY", "1")
-    monkeypatch.setattr(hooks_mod, "AMBIENT_SCORE_THRESHOLD", 0.0)
+    monkeypatch.setattr(pipelines_mod, "AMBIENT_SCORE_THRESHOLD", 0.0)
     mock_cross_encoder._scores = [5.0] * 10
 
     seen = {"vec_path": False, "literal_path": False}
-    real_vec = hooks_mod.retrieval.hybrid_search_with_vec
-    real_lit = hooks_mod.retrieval.hybrid_search
+    real = warmed_engine.hybrid_search
 
-    def spy_vec(*a, **kw):
-        seen["vec_path"] = True
-        return real_vec(*a, **kw)
+    def spy(query, *, qvec=None, k_pool=30):
+        if qvec is not None:
+            seen["vec_path"] = True
+        else:
+            seen["literal_path"] = True
+        return real(query, qvec=qvec, k_pool=k_pool)
 
-    def spy_lit(*a, **kw):
-        seen["literal_path"] = True
-        return real_lit(*a, **kw)
-
-    monkeypatch.setattr(hooks_mod.retrieval, "hybrid_search_with_vec", spy_vec)
-    monkeypatch.setattr(hooks_mod.retrieval, "hybrid_search", spy_lit)
+    monkeypatch.setattr(warmed_engine, "hybrid_search", spy)
 
     # Force the embedder to return (0, dim) — the empty-batch shape.
     real_encode = warmed_engine._embedder.encode
@@ -297,7 +293,7 @@ def test_ambient_warm_budget(warmed_engine, monkeypatch, mock_cross_encoder):
     """Warm ambient (stubs throughout) must complete fast. The threshold is
     deliberately loose — we're not benchmarking, we're guarding against an
     accidental synchronous network call sneaking in."""
-    monkeypatch.setattr(hooks_mod, "AMBIENT_SCORE_THRESHOLD", 0.0)
+    monkeypatch.setattr(pipelines_mod, "AMBIENT_SCORE_THRESHOLD", 0.0)
     mock_cross_encoder._scores = [1.0] * 10
 
     start = time.monotonic()

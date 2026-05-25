@@ -1,48 +1,27 @@
-"""SQLite-backed catalog for files, parents, chunks + atomic writes for the
-embeddings .npz. The single source of truth for chunk ordering: SELECT chunks
-ordered by (parent_id, ord) — the row index in that ordering equals the row
-index in the embeddings array (the `embed_row`).
+"""SQLite-backed catalog for files, parents, chunks, and meta key/value.
 
-BM25 is intentionally NOT persisted to disk: it's rebuilt from `chunks` on
+The single source of truth for chunk ordering: ``SELECT chunks ORDER BY
+(parent_id, ord)`` — the row index in that ordering equals the row index in
+the embeddings array (the ``embed_row``).
+
+BM25 is intentionally NOT persisted to disk: it's rebuilt from ``chunks`` on
 every engine load. The previous pickle-on-disk path was a code-execution
 sink (CWE-502) for anyone who could write the data dir. Tokenization is
 cheap; pickle is forever.
+
+Embedding ``.npz`` I/O lives in ``artifacts.py``; filesystem reconciliation
+lives in ``manifest.py``. ``Store`` here is the catalog only — see those
+modules for the split rationale.
 """
 from __future__ import annotations
 
-import os
 import sqlite3
 from contextlib import contextmanager
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, Sequence
 
-import numpy as np
-
-from .config import bm25_path, db_path, get_data_dir, npz_path
-
-
-@dataclass
-class ChunkRow:
-    id: int
-    parent_id: int
-    ord: int
-    text: str
-    embed_row: int
-    contextual_prefix: str | None = None
-    text_for_embedding: str | None = None
-    text_for_bm25: str | None = None
-
-    @property
-    def effective_embedding_text(self) -> str:
-        """`prefix + chunk` when contextual retrieval is active, else the raw
-        chunk. Single source of truth so embeddings rebuild and any future
-        inspectors agree."""
-        return self.text_for_embedding or self.text
-
-    @property
-    def effective_bm25_text(self) -> str:
-        return self.text_for_bm25 or self.text
+from .config import db_path, get_data_dir
+from .models import ChunkRow
 
 
 # SQLite has a fixed parameter ceiling (999 on older builds). 500 keeps us
@@ -118,14 +97,6 @@ class Store:
     def db_path(self) -> Path:
         return db_path(self.data_dir)
 
-    @property
-    def npz_path(self) -> Path:
-        return npz_path(self.data_dir)
-
-    @property
-    def bm25_path(self) -> Path:
-        return bm25_path(self.data_dir)
-
     def connect(self) -> sqlite3.Connection:
         if self._conn is not None:
             return self._conn
@@ -194,62 +165,6 @@ class Store:
                 k, v = row_to_kv(r)
                 out[k] = v
         return out
-
-    # --- manifest diff ---
-
-    def manifest_diff(
-        self,
-        disk_files: dict[Path, os.stat_result],
-        hash_fn: Callable[[Path], str] | None = None,
-    ) -> dict:
-        """Returns {unchanged, changed, new, deleted}, each a list/dict by path.
-
-        - unchanged: same mtime AND size (and same content_hash, when
-          ``hash_fn`` is supplied) as the row in `files`.
-        - changed: row exists but mtime, size, or (when checked) content_hash
-          differ.
-        - new: path not in `files` table.
-        - deleted: row exists but path not in `disk_files`.
-
-        ``hash_fn`` is only invoked on the (mtime, size)-match branch, so
-        unchanged files dominate the cost: each pays exactly one hash. Files
-        with stale (mtime, size) shortcut to "changed" without re-hashing —
-        the hash will be recomputed when the file is reindexed anyway.
-        """
-        conn = self.connect()
-        rows = {Path(r["path"]): {"id": r["id"], "mtime": r["mtime"],
-                                  "size": r["size"], "content_hash": r["content_hash"]}
-                for r in conn.execute("SELECT id, path, mtime, size, content_hash FROM files")}
-
-        unchanged: list[Path] = []
-        changed: list[tuple[Path, int]] = []  # (path, file_id)
-        new: list[Path] = []
-        deleted: list[int] = []
-
-        for path, st in disk_files.items():
-            row = rows.get(path)
-            if row is None:
-                new.append(path)
-            elif row["mtime"] == st.st_mtime and row["size"] == st.st_size:
-                if hash_fn is None:
-                    unchanged.append(path)
-                else:
-                    disk_hash = hash_fn(path)
-                    if disk_hash == row["content_hash"]:
-                        unchanged.append(path)
-                    else:
-                        # in-place edit that preserved (mtime, size) — rare but
-                        # real (e.g. `os.utime` after a same-size rewrite).
-                        changed.append((path, row["id"]))
-            else:
-                changed.append((path, row["id"]))
-
-        for path, row in rows.items():
-            if path not in disk_files:
-                deleted.append(row["id"])
-
-        return {"unchanged": unchanged, "changed": changed,
-                "new": new, "deleted": deleted}
 
     def delete_files(self, file_ids: list[int]) -> None:
         if not file_ids:
@@ -452,38 +367,6 @@ class Store:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, str(value)),
             )
-
-    # --- atomic embeddings + bm25 IO ---
-
-    def save_embeddings(self, target_path: Path, embeddings: np.ndarray,
-                        chunk_ids: list[int] | None = None) -> None:
-        """Write the embeddings array atomically. `chunk_ids` is accepted for
-        backwards compatibility but no longer persisted — the canonical
-        row-index ↔ chunk-id mapping lives in SQLite (`chunks.embed_row`),
-        and the engine reconstructs the list from `iter_chunks_ordered()`.
-        """
-        del chunk_ids  # dropped from .npz on purpose; kept in the signature
-        target = Path(target_path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_suffix(target.suffix + ".tmp")
-        # Pass a file handle so numpy doesn't auto-append `.npz` and break our
-        # atomic-rename scheme.
-        try:
-            with open(tmp, "wb") as fh:
-                np.savez(fh, embeddings=embeddings)
-            os.replace(tmp, target)
-        finally:
-            if tmp.exists():
-                try:
-                    tmp.unlink()
-                except OSError:
-                    pass
-
-    def load_embeddings(self, target_path: Path) -> np.ndarray:
-        """Return the embeddings array. Old `.npz` files that still carry a
-        `chunk_ids` array load fine — we just ignore that key."""
-        with np.load(target_path) as data:
-            return data["embeddings"]
 
     def iter_bm25_texts_ordered(self) -> Iterator[str]:
         """BM25 text per chunk in canonical order.

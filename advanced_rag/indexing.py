@@ -1,6 +1,7 @@
-"""Walks user-supplied directories, diffs against the catalog, extracts parents
-and chunks for new/changed files, then rebuilds embeddings.npz and bm25.pkl
-from the canonical SQLite chunk ordering.
+"""Walks user-supplied directories, diffs against the catalog, extracts
+parents and chunks for new/changed files, then rebuilds ``embeddings.npz``
+from the canonical SQLite chunk ordering. BM25 is rebuilt at engine load
+time from the same canonical order; no pickle on disk.
 """
 from __future__ import annotations
 
@@ -13,42 +14,25 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
-from . import contextual
+from . import contextual, manifest
+from .artifacts import ArtifactStore
 from .chunking import recursive_split
-from .config import (
-    CHUNK_OVERLAP,
-    CONTEXTUAL_CONCURRENCY,
-    MAX_CHUNK,
-    MAX_INDEX_FILE_BYTES,
-    bm25_path,
-    npz_path,
-)
-from .parents import (
-    Parent,
-    _enforce_parent_cap,
-    extract_md,
-    extract_pdf,
-    extract_txt,
-)
+from .config import CHUNK_OVERLAP, MAX_CHUNK, MAX_INDEX_FILE_BYTES
+from .contextual import CONTEXTUAL_CONCURRENCY
+from .extractors import DEFAULT_REGISTRY
+from .models import Parent
+from .parents import _enforce_parent_cap
 from .storage import Store
 
 log = logging.getLogger(__name__)
 
 
-def _read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8", errors="replace")
-
-
-# Single dispatch table: a file is "supported" iff its suffix appears here,
-# and SUPPORTED_SUFFIXES derives from it so the two can never drift apart.
-_EXTRACTORS: dict[str, Callable[[Path], list[Parent]]] = {
-    ".md": lambda p: extract_md(_read_text(p)),
-    ".txt": lambda p: extract_txt(_read_text(p)),
-    ".pdf": extract_pdf,
-}
-SUPPORTED_SUFFIXES = frozenset(_EXTRACTORS)
+# The supported set is derived from the default extractor registry so a new
+# extractor implementer doesn't have to edit two places. Third-party code that
+# wants to add an extractor mutates ``extractors.DEFAULT_REGISTRY`` (or wires
+# its own and passes it to a future API).
+SUPPORTED_SUFFIXES = DEFAULT_REGISTRY.supported_suffixes
 
 
 def _hash_file(path: Path, chunk_size: int = 65536) -> str:
@@ -113,8 +97,7 @@ def _walk(root: Path) -> list[Path]:
 
 
 def _extract_parents(path: Path) -> list[Parent]:
-    extractor = _EXTRACTORS.get(path.suffix.lower())
-    return extractor(path) if extractor is not None else []
+    return DEFAULT_REGISTRY.extract(path)
 
 
 # --- per-file write helpers ----------------------------------------------
@@ -273,12 +256,6 @@ def index_path(path, force: bool = False, store: Store | None = None,
     if not root.exists():
         raise FileNotFoundError(f"index path does not exist: {root}")
 
-    # `store_owned` tracks whether we constructed the Store ourselves. When
-    # the caller passed one (tests, alternate data dirs), we must NOT reset
-    # the process-wide engine at the end — that singleton may be bound to a
-    # different data_dir and resetting it would cost the next ambient call
-    # a cold reload for unrelated reasons.
-    store_owned = store is None
     own_store = store or Store()
     if embedder is None:
         from .embeddings import Embedder as _Emb
@@ -289,7 +266,7 @@ def index_path(path, force: bool = False, store: Store | None = None,
     # Pass `_hash_file` as the (mtime, size) tiebreaker so in-place edits that
     # preserved both fields still get reindexed. Cost: one SHA-256 per file
     # whose (mtime, size) match — files with stale stats short-circuit.
-    diff = own_store.manifest_diff(disk_map, hash_fn=_hash_file)
+    diff = manifest.diff(own_store, disk_map, hash_fn=_hash_file)
     changeset = _compute_changeset(own_store, files, diff, force)
 
     # Deletes first (cascades to parents/chunks).
@@ -301,17 +278,6 @@ def index_path(path, force: bool = False, store: Store | None = None,
     new_files, new_parents, new_chunks = _apply_inserts(own_store, ordered_inserts)
 
     rebuild_artifacts(own_store, embedder)
-
-    # If an engine singleton has been created, drop its cached state so the
-    # next query reloads from the freshly written .npz / .pkl. Only reset
-    # when we own the store: caller-supplied stores belong to a different
-    # data_dir (tests, isolated runs) and the singleton would be unrelated.
-    if store_owned:
-        try:
-            from .engine import get_engine  # local import to avoid cycles
-            get_engine().reset()
-        except Exception:
-            pass
 
     return {
         "indexed_root": str(root),
@@ -326,25 +292,14 @@ def index_path(path, force: bool = False, store: Store | None = None,
 
 def rebuild_artifacts(store: Store, embedder) -> None:
     """Rebuild embeddings.npz from the canonical SQLite chunk order. Also
-    rewrites each chunk's `embed_row` so row N of the embeddings array maps
-    to chunk_ids[N]. BM25 is no longer persisted — see storage.py."""
+    rewrites each chunk's ``embed_row`` so row N of the embeddings array
+    maps to chunk_ids[N]. BM25 is no longer persisted — see storage.py."""
     rows = list(store.iter_chunks_ordered())
-
-    # Drop any legacy bm25.pkl regardless of whether the new index is empty.
-    # Leaving it on disk would be a stale, unreferenced pickle file — and a
-    # cohabiting attacker's planted file (the exact threat we removed pickle
-    # to address) would otherwise survive a re-index unnoticed.
-    legacy_bm25 = bm25_path(store.data_dir)
-    if legacy_bm25.exists():
-        try:
-            legacy_bm25.unlink()
-        except OSError:
-            pass
+    artifacts = ArtifactStore(store.data_dir)
+    artifacts.unlink_legacy_bm25()
 
     if not rows:
-        npz_p = npz_path(store.data_dir)
-        if npz_p.exists():
-            npz_p.unlink()
+        artifacts.delete()
         return
 
     embed_texts = [r.effective_embedding_text for r in rows]
@@ -354,11 +309,13 @@ def rebuild_artifacts(store: Store, embedder) -> None:
     if embeddings.shape[0] != len(embed_texts):
         raise RuntimeError("embedder returned wrong number of vectors")
 
-    store.save_embeddings(npz_path(store.data_dir), embeddings)
+    artifacts.save(embeddings)
     store.bulk_update_embed_rows([(cid, row) for row, cid in enumerate(chunk_ids)])
 
-    model_name = getattr(embedder, "model_name", None) or getattr(
-        embedder, "_model_name", "unknown"
-    )
+    model_name = getattr(embedder, "model_name", None) or "unknown"
     store.set_meta("embed_model", str(model_name))
     store.set_meta("embed_dim", str(int(embeddings.shape[1])))
+    # Bump the version counter so any RAGEngine pointed at this data dir
+    # reloads on its next call. Replaces the old explicit engine.reset()
+    # call from index_path — see engine._ensure_loaded for the consumer.
+    store.set_meta("index_version", str(time.monotonic_ns()))

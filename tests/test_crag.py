@@ -18,6 +18,7 @@ import pytest
 
 import advanced_rag.crag as crag_mod
 import advanced_rag.hooks as hooks_mod
+import advanced_rag.pipelines as pipelines_mod
 import advanced_rag.state as state_mod
 from advanced_rag import _anthropic, convo
 from advanced_rag.engine import RAGEngine, reset_for_tests, set_engine_for_tests
@@ -252,7 +253,7 @@ def test_ambient_path_never_invokes_crag(warmed_engine, monkeypatch,
     """HERMES_RAG_CRAG=1 must not change ambient behavior. The ambient hook
     must not call judge_retrieval / reformulate_query."""
     monkeypatch.setenv("HERMES_RAG_CRAG", "1")
-    monkeypatch.setattr(hooks_mod, "AMBIENT_SCORE_THRESHOLD", 0.0)
+    monkeypatch.setattr(pipelines_mod, "AMBIENT_SCORE_THRESHOLD", 0.0)
 
     judge_calls = {"n": 0}
     reformulate_calls = {"n": 0}

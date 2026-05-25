@@ -12,6 +12,8 @@ import os
 import re
 import threading
 
+ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
+
 _CLIENT = None
 _LOCK = threading.Lock()
 

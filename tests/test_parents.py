@@ -3,8 +3,8 @@ from pathlib import Path
 import pytest
 
 from advanced_rag import parents
+from advanced_rag.models import Parent
 from advanced_rag.parents import (
-    Parent,
     _enforce_parent_cap,
     extract_md,
     extract_pdf,

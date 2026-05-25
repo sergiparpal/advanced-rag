@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 import advanced_rag.hooks as hooks_mod
+import advanced_rag.pipelines as pipelines_mod
 import advanced_rag.state as state_mod
 from advanced_rag.engine import RAGEngine, reset_for_tests, set_engine_for_tests
 from advanced_rag.hooks import ambient_pre_llm_call
@@ -65,7 +66,7 @@ def test_returns_none_when_no_hits(warmed_engine):
 
 
 def test_returns_none_when_below_threshold(warmed_engine, monkeypatch):
-    monkeypatch.setattr(hooks_mod, "AMBIENT_SCORE_THRESHOLD", 999.0)
+    monkeypatch.setattr(pipelines_mod, "AMBIENT_SCORE_THRESHOLD", 999.0)
     out = ambient_pre_llm_call(
         session_id=None, user_message="cosmic rays from outer space",
         conversation_history=None, is_first_turn=True, model=None, platform=None,
@@ -75,7 +76,7 @@ def test_returns_none_when_below_threshold(warmed_engine, monkeypatch):
 
 def test_returns_context_on_match(warmed_engine, monkeypatch):
     # Lower the threshold to ensure the stub embedder produces a match strong enough
-    monkeypatch.setattr(hooks_mod, "AMBIENT_SCORE_THRESHOLD", 0.0)
+    monkeypatch.setattr(pipelines_mod, "AMBIENT_SCORE_THRESHOLD", 0.0)
     out = ambient_pre_llm_call(
         session_id=None, user_message="cosmic rays from outer space",
         conversation_history=None, is_first_turn=True, model=None, platform=None,
@@ -90,7 +91,7 @@ def test_never_raises_when_engine_misbehaves(warmed_engine, monkeypatch):
     None instead of raising."""
     def boom(*a, **kw):
         raise RuntimeError("synthetic engine failure")
-    monkeypatch.setattr(hooks_mod.retrieval, "hybrid_search", boom)
+    monkeypatch.setattr(warmed_engine, "hybrid_search", boom)
     out = ambient_pre_llm_call(
         session_id=None, user_message="something substantive enough",
         conversation_history=None, is_first_turn=True, model=None, platform=None,

@@ -14,8 +14,10 @@ import logging
 import os
 from operator import itemgetter
 
-from .config import COHERE_RERANK_MODEL, RERANK_MODEL
-from .retrieval import ParentResult
+from .models import ParentResult
+
+RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+COHERE_RERANK_MODEL = "rerank-english-v3.0"
 
 log = logging.getLogger(__name__)
 

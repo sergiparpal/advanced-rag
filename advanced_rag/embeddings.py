@@ -6,13 +6,46 @@ Tests inject a stub embedder rather than this real one — keeps
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
-from .config import (
-    EMBED_MODEL_DIMS,
-    get_embed_dim,
-    get_embed_model,
-)
+
+# Modern multilingual default. Override at runtime with HERMES_RAG_EMBED_MODEL
+# (any sentence-transformers-compatible id). Switching models requires a full
+# `hermes rag index --force` — the .npz dim won't match otherwise.
+DEFAULT_EMBED_MODEL = "BAAI/bge-m3"
+# Known dimensionalities. Used to pre-allocate the `(0, dim)` empty-result
+# array in `Embedder.encode([])` without loading the model. Anything missing
+# here is auto-detected on first load by querying the model itself.
+EMBED_MODEL_DIMS: dict[str, int] = {
+    "all-MiniLM-L6-v2": 384,
+    "sentence-transformers/all-MiniLM-L6-v2": 384,
+    "BAAI/bge-base-en-v1.5": 768,
+    "BAAI/bge-small-en-v1.5": 384,
+    "BAAI/bge-m3": 1024,
+}
+
+
+def get_embed_model() -> str:
+    """Configured embedding model id. HERMES_RAG_EMBED_MODEL overrides the
+    default; unset → DEFAULT_EMBED_MODEL."""
+    env = os.environ.get("HERMES_RAG_EMBED_MODEL")
+    return env.strip() if env and env.strip() else DEFAULT_EMBED_MODEL
+
+
+def get_embed_dim() -> int | None:
+    """Optional manual dimension override via HERMES_RAG_EMBED_DIM. Returns
+    None when unset/invalid so the Embedder auto-detects from the loaded
+    model."""
+    env = os.environ.get("HERMES_RAG_EMBED_DIM")
+    if not env:
+        return None
+    try:
+        n = int(env)
+        return n if n > 0 else None
+    except ValueError:
+        return None
 
 
 class Embedder:

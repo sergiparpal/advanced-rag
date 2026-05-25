@@ -4,7 +4,7 @@ import pytest
 
 import advanced_rag.rerank as rerank_mod
 from advanced_rag.rerank import rerank
-from advanced_rag.retrieval import ParentResult
+from advanced_rag.models import ParentResult
 
 
 def _parents():

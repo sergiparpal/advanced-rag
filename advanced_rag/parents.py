@@ -7,25 +7,17 @@ once a chunk hits.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 from .config import MAX_PARENT_CHARS, MAX_PDF_PAGE_CHARS, PREAMBLE_MIN_CHARS
+from .models import Parent
 
 PdfReader = None  # patched by tests; lazily imported in extract_pdf
 
 
 class IndexingError(RuntimeError):
     """Raised when an indexing precondition is missing (e.g. pypdf for PDFs)."""
-
-
-@dataclass
-class Parent:
-    kind: str                  # 'section' | 'page' | 'paragraph_group' | 'preamble'
-    title: str | None
-    text: str
-    page_no: int | None = None
 
 
 _H2_RE = re.compile(r"^##\s+", re.MULTILINE)

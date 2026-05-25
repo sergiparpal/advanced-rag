@@ -15,8 +15,9 @@ import logging
 import re
 
 from . import _anthropic
-from .config import ANTHROPIC_MODEL, env_flag
-from .retrieval import ParentResult
+from ._anthropic import ANTHROPIC_MODEL
+from .config import env_flag
+from .models import ParentResult
 
 log = logging.getLogger(__name__)
 

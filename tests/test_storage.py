@@ -1,17 +1,4 @@
-import os
-from pathlib import Path
-
-import numpy as np
-
 from advanced_rag.storage import Store
-
-
-def _stat(path: Path) -> os.stat_result:
-    return path.stat()
-
-
-def _seed_file(store, path, mtime=1000.0, size=42, h="hash", filetype="md"):
-    return store.bulk_insert_files([(str(path), mtime, size, h, filetype, 0.0)])
 
 
 def test_init_creates_data_dir_and_schema(tmp_data_dir):
@@ -30,68 +17,6 @@ def test_explicit_data_dir_overrides_env(tmp_path, monkeypatch):
     assert other.exists()
 
 
-def test_manifest_diff_buckets(tmp_data_dir, tmp_path):
-    store = Store()
-    a = tmp_path / "a.md"
-    b = tmp_path / "b.md"
-    c = tmp_path / "c.md"
-    for f in (a, b, c):
-        f.write_text("x")
-    _seed_file(store, a, mtime=1.0, size=1)  # unchanged
-    _seed_file(store, b, mtime=2.0, size=2)  # changed
-    _seed_file(store, Path("/gone.md"), mtime=3.0, size=3)  # deleted
-
-    disk = {
-        a: _Stat(mtime=1.0, size=1),
-        b: _Stat(mtime=99.0, size=99),  # mtime changed
-        c: _Stat(mtime=4.0, size=4),    # new
-    }
-    diff = store.manifest_diff(disk)
-    assert a in diff["unchanged"]
-    assert any(p == b for p, _ in diff["changed"])
-    assert c in diff["new"]
-    assert len(diff["deleted"]) == 1
-
-
-def test_manifest_diff_hash_tiebreaker_detects_in_place_edit(tmp_data_dir, tmp_path):
-    """When (mtime, size) match, the hash callback decides changed vs unchanged."""
-    store = Store()
-    a = tmp_path / "a.md"
-    a.write_text("x")
-    _seed_file(store, a, mtime=1.0, size=1, h="hash-original")
-
-    disk = {a: _Stat(mtime=1.0, size=1)}
-
-    # Same hash → unchanged.
-    diff = store.manifest_diff(disk, hash_fn=lambda _p: "hash-original")
-    assert a in diff["unchanged"]
-    assert diff["changed"] == []
-
-    # Different hash → changed (the in-place-edit case).
-    diff = store.manifest_diff(disk, hash_fn=lambda _p: "hash-different")
-    assert diff["unchanged"] == []
-    assert any(p == a for p, _ in diff["changed"])
-
-
-def test_manifest_diff_hash_fn_skipped_when_stat_already_differs(tmp_data_dir, tmp_path):
-    """The hash callback must not run for files whose (mtime, size) already
-    differ — the diff has enough signal to mark them changed without I/O."""
-    store = Store()
-    a = tmp_path / "a.md"
-    a.write_text("x")
-    _seed_file(store, a, mtime=1.0, size=1, h="hash-original")
-
-    calls: list[Path] = []
-
-    def hash_fn(p: Path) -> str:
-        calls.append(p)
-        return "anything"
-
-    disk = {a: _Stat(mtime=99.0, size=99)}
-    store.manifest_diff(disk, hash_fn=hash_fn)
-    assert calls == []
-
-
 def test_cascade_delete_kills_parents_and_chunks(tmp_data_dir):
     store = Store()
     file_ids = store.bulk_insert_files([("/x.md", 0.0, 0, "h", "md", 0.0)])
@@ -108,40 +33,6 @@ def test_cascade_delete_kills_parents_and_chunks(tmp_data_dir):
     assert store.stats()["chunks"] == 3
     store.delete_files([fid])
     assert store.stats() == {**store.stats(), "files": 0, "parents": 0, "chunks": 0}
-
-
-def test_save_and_load_embeddings_atomic(tmp_data_dir):
-    store = Store()
-    arr = np.arange(12, dtype=np.float32).reshape(3, 4)
-    store.save_embeddings(store.npz_path, arr, [10, 20, 30])
-    loaded = store.load_embeddings(store.npz_path)
-    assert np.array_equal(loaded, arr)
-    # the .tmp must be cleaned up after a successful write
-    assert not store.npz_path.with_suffix(store.npz_path.suffix + ".tmp").exists()
-
-
-def test_load_embeddings_ignores_legacy_chunk_ids_array(tmp_data_dir):
-    """`.npz` files written by older versions still carried `chunk_ids`.
-    The new loader silently ignores that key and reads only `embeddings`."""
-    store = Store()
-    arr = np.arange(8, dtype=np.float32).reshape(2, 4)
-    # Manually write an .npz in the old shape so we don't accidentally drift
-    # the old compatibility surface.
-    np.savez(store.npz_path, embeddings=arr,
-             chunk_ids=np.asarray([99, 100], dtype=np.int64))
-    loaded = store.load_embeddings(store.npz_path)
-    assert np.array_equal(loaded, arr)
-
-
-def test_save_embeddings_accepts_chunk_ids_for_compat(tmp_data_dir):
-    """Old callers passing `chunk_ids=` should still work; the array is
-    intentionally not persisted to the .npz."""
-    store = Store()
-    arr = np.arange(8, dtype=np.float32).reshape(2, 4)
-    store.save_embeddings(store.npz_path, arr, chunk_ids=[1, 2])
-    with np.load(store.npz_path) as data:
-        assert "embeddings" in data.files
-        assert "chunk_ids" not in data.files
 
 
 def test_iter_bm25_texts_prefers_contextual(tmp_data_dir):
@@ -213,11 +104,3 @@ def test_iter_chunks_ordered_canonical_order(tmp_data_dir):
     assert [(r.parent_id, r.ord) for r in rows] == [
         (p1, 0), (p1, 1), (p2, 0), (p2, 1)
     ]
-
-
-class _Stat:
-    """Tiny stand-in for os.stat_result."""
-
-    def __init__(self, mtime: float, size: int):
-        self.st_mtime = mtime
-        self.st_size = size
