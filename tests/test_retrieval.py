@@ -8,6 +8,7 @@ from hybrid_rag.retrieval import (
     _tokenize,
     chunks_to_parents,
     hybrid_search,
+    hybrid_search_chunk_ids,
 )
 
 
@@ -48,9 +49,18 @@ class FakeStore:
             "page_no": p.page_no, "source_path": p.source_path,
         }
 
-    def get_parents(self, parent_ids):
-        return {pid: row for pid in parent_ids
-                if (row := self.get_parent(pid)) is not None}
+    def get_parents(self, parent_ids, *, text_cap=None):
+        out = {}
+        for pid in parent_ids:
+            row = self.get_parent(pid)
+            if row is None:
+                continue
+            # Mirror the SUBSTR semantics of the real store so two-phase
+            # callers can exercise the truncated/full text round-trip.
+            if text_cap is not None and "text" in row and row["text"]:
+                row = {**row, "text": row["text"][:text_cap]}
+            out[pid] = row
+        return out
 
 
 class FakeEngine:
@@ -117,7 +127,55 @@ def test_hybrid_search_returns_empty_when_corpus_empty(stub_embedder):
     assert hybrid_search(eng, "anything", k_pool=5) == []
 
 
+def test_hybrid_search_chunk_ids_skips_parent_resolution(stub_embedder):
+    """The chunk-ids-only variant must return the same chunk ranking as
+    `hybrid_search` but without resolving parent IDs. We verify that by
+    spying on the store: zero calls to `parent_ids_for_chunks` during
+    the search."""
+    engine = _build_engine(stub_embedder)
+    calls = {"n": 0}
+    real = engine.store.parent_ids_for_chunks
+
+    def counting(ids):
+        calls["n"] += 1
+        return real(ids)
+
+    engine.store.parent_ids_for_chunks = counting
+
+    chunk_ids = hybrid_search_chunk_ids(engine, "cosmic ray particles", k_pool=5)
+    assert chunk_ids, "expected at least one chunk id"
+    assert calls["n"] == 0, "chunk-ids-only path must not resolve parents"
+
+    # And the order should match what hybrid_search returns (same fusion math).
+    hits = hybrid_search(engine, "cosmic ray particles", k_pool=5)
+    assert chunk_ids == [h.chunk_id for h in hits]
+
+
 # --- parent rollup MAX vs SUM ---
+
+def test_rehydrate_parent_text_restores_full_body(stub_embedder):
+    """B5: after rerank against truncated text, the surviving parents
+    must come back with their full text — the truncation is invisible
+    to the caller."""
+    from hybrid_rag.models import ParentResult
+    from hybrid_rag.retrieval import rehydrate_parent_text
+
+    # Engine where parent 1 has a long body. Pass truncated ParentResult
+    # in; expect the full body back out.
+    long_body = "z" * 4000
+    parents = [_Parent(id=1, title="A", kind="section", text=long_body)]
+    engine = FakeEngine([], [], [], stub_embedder, parents)
+    truncated = [ParentResult(
+        parent_id=1, title="A", kind="section", page_no=None,
+        text=long_body[:200],  # truncated by the rerank-pool fetch
+        source_path="/x.md", score=0.5, rerank_score=1.2,
+    )]
+    out = rehydrate_parent_text(engine, truncated)
+    assert len(out) == 1
+    assert out[0].text == long_body
+    # And the rerank score survives the swap.
+    assert out[0].rerank_score == 1.2
+
 
 def test_max_rollup_picks_strongest_chunk(stub_embedder):
     engine = _build_engine(stub_embedder)

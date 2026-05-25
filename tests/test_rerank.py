@@ -82,6 +82,41 @@ def test_cohere_response_with_negative_idx_is_skipped(mock_cohere):
     assert out[0].rerank_score == 0.5
 
 
+def test_ambient_text_cap_truncates_pairs_sent_to_cross_encoder(
+    monkeypatch, mock_cross_encoder,
+):
+    """`rerank_local(text_cap=AMBIENT_RERANK_TEXT_CHARS)` must clip each
+    parent's text before it reaches the cross-encoder — that's what keeps
+    the per-turn ambient rerank inside its latency budget."""
+    monkeypatch.delenv("COHERE_API_KEY", raising=False)
+    long_parents = [
+        ParentResult(parent_id=i, title=f"T{i}", kind="section", page_no=None,
+                     text="x" * 8000, source_path=f"/{i}.md", score=0.5)
+        for i in range(3)
+    ]
+
+    seen_lengths: list[int] = []
+
+    class _Spy:
+        def __init__(self, _name):
+            pass
+
+        def predict(self, pairs):
+            for _q, txt in pairs:
+                seen_lengths.append(len(txt))
+            return [float(len(pairs) - i) for i in range(len(pairs))]
+
+    mock_cross_encoder.CrossEncoder = _Spy
+    rerank_mod._CROSS = None
+
+    rerank_mod.rerank_local(
+        "q", long_parents, top_k=2,
+        text_cap=rerank_mod.AMBIENT_RERANK_TEXT_CHARS,
+    )
+    assert seen_lengths and all(L == rerank_mod.AMBIENT_RERANK_TEXT_CHARS
+                                for L in seen_lengths)
+
+
 def test_falls_through_when_cohere_returns_empty(mock_cohere, mock_cross_encoder):
     """A Cohere call that succeeds but returns zero results must still
     trigger the local fallback — otherwise the user sees an empty answer

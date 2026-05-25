@@ -15,6 +15,7 @@ persists across process restarts.
 from __future__ import annotations
 
 import threading
+from collections import OrderedDict
 
 import numpy as np
 
@@ -24,8 +25,15 @@ from .config import env_flag
 # before mixing. Owned here because this module is the only consumer.
 AMBIENT_CONVO_MEMORY_WEIGHTS = (1.0, 0.25, 0.1)
 
+# Per-session ring buffers are kept in memory across LLM turns. We cap the
+# number of distinct sessions tracked so a long-running Hermes process
+# can't leak unboundedly as users churn through session ids. Each entry
+# holds ~3 × dim × 4 bytes; at the default 1024-dim embedder that's ~12
+# KiB per session, so 4096 sessions cap RSS contribution at ~48 MiB.
+_MAX_RINGS = 4096
+
 _LOCK = threading.Lock()
-_RINGS: dict[str, list[np.ndarray]] = {}
+_RINGS: "OrderedDict[str, list[np.ndarray]]" = OrderedDict()
 _RING_SIZE = len(AMBIENT_CONVO_MEMORY_WEIGHTS)  # current + N priors
 
 
@@ -35,22 +43,38 @@ def is_enabled() -> bool:
 
 def push(session_id: str, vec: np.ndarray) -> None:
     """Insert `vec` as the newest entry for `session_id`. Older entries
-    drop off the tail when the buffer reaches RING_SIZE."""
+    drop off the tail when the buffer reaches RING_SIZE. Touching a
+    session refreshes its LRU position; once the total number of tracked
+    sessions exceeds _MAX_RINGS, the least-recently-used session's ring
+    is evicted."""
     if not session_id:
         return
     with _LOCK:
-        ring = _RINGS.setdefault(session_id, [])
+        ring = _RINGS.get(session_id)
+        if ring is None:
+            ring = []
+            _RINGS[session_id] = ring
+        else:
+            _RINGS.move_to_end(session_id)
         ring.insert(0, np.asarray(vec, dtype=np.float32))
         if len(ring) > _RING_SIZE:
             del ring[_RING_SIZE:]
+        while len(_RINGS) > _MAX_RINGS:
+            _RINGS.popitem(last=False)
 
 
 def get_ring(session_id: str) -> list[np.ndarray]:
-    """Snapshot copy of the ring buffer for `session_id`, newest first."""
+    """Snapshot copy of the ring buffer for `session_id`, newest first.
+    Reading also refreshes the LRU position so an actively-read session
+    isn't evicted out from under a pending push."""
     if not session_id:
         return []
     with _LOCK:
-        return list(_RINGS.get(session_id, []))
+        ring = _RINGS.get(session_id)
+        if ring is None:
+            return []
+        _RINGS.move_to_end(session_id)
+        return list(ring)
 
 
 def reset_for_tests() -> None:

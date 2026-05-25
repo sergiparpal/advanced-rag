@@ -27,10 +27,37 @@ def test_index_path_creates_artifacts(tmp_data_dir, tmp_path, stub_embedder):
     assert summary["parents"] >= 3
     assert summary["chunks"] >= 3
     assert arts.exists()
-    # BM25 is no longer persisted — it's rebuilt from SQLite on engine load.
-    # Any bm25.pkl on disk would be either a stale legacy file or a planted
-    # one; either way, indexing must leave none behind.
+    # The pickle is gone (CWE-502). The replacement BM25 state is JSON.
     assert not arts.legacy_bm25_path.exists()
+    # The JSON sidecar must be present so engine load can skip the
+    # tokenize+rebuild step — the whole point of S3.
+    assert arts.bm25_state_exists()
+
+
+def test_indexed_bm25_state_matches_from_sqlite_rebuild(
+    tmp_data_dir, tmp_path, stub_embedder,
+):
+    """The persisted BM25 sidecar must produce the same scoring as the
+    fallback rebuild — otherwise the optimization changes search results
+    silently."""
+    from hybrid_rag.engine import RAGEngine, _bm25_from_state
+    docs = _stage(tmp_path)
+    store = Store()
+    index_path(docs, store=store, embedder=stub_embedder)
+
+    arts = ArtifactStore(store.data_dir)
+    eng = RAGEngine(store=store, embedder=stub_embedder)
+
+    from_sidecar = _bm25_from_state(arts.load_bm25_state())
+    from_rebuild = eng._build_bm25()
+    assert from_sidecar is not None and from_rebuild is not None
+
+    # Same corpus, same parameters, same scoring.
+    assert from_sidecar.corpus_size == from_rebuild.corpus_size
+    assert from_sidecar.avgdl == from_rebuild.avgdl
+    s1 = from_sidecar.get_scores(["cosmic", "rays"])
+    s2 = from_rebuild.get_scores(["cosmic", "rays"])
+    assert list(s1) == list(s2)
 
 
 def test_index_unlinks_legacy_bm25_pickle(tmp_data_dir, tmp_path, stub_embedder):

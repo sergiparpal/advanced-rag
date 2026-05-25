@@ -77,6 +77,56 @@ def test_ensure_loaded_reads_artifacts_once(tmp_data_dir, stub_embedder):
     assert eng._bm25 is not None
 
 
+def test_bm25_state_sidecar_skips_rebuild(tmp_data_dir, stub_embedder, monkeypatch):
+    """If the BM25 sidecar exists, engine load must decode it instead of
+    re-tokenizing the chunks table. We verify by stubbing `_build_bm25`
+    and checking it never gets called when a sidecar is present."""
+    from hybrid_rag.indexing import _build_bm25_state
+    store = Store()
+    arr = np.eye(3, 32, dtype=np.float32)
+    chunk_ids = [10, 20, 30]
+    _seed_chunks(store, chunk_ids)
+    arts = ArtifactStore(store.data_dir)
+    arts.save(arr)
+    arts.save_bm25_state(_build_bm25_state(
+        ["alpha alpha", "beta beta gamma", "delta epsilon delta"]
+    ))
+
+    eng = RAGEngine(store=store, embedder=stub_embedder)
+    rebuilt = {"called": False}
+
+    def boom():
+        rebuilt["called"] = True
+        raise AssertionError("BM25 rebuild should be skipped when sidecar exists")
+
+    monkeypatch.setattr(eng, "_build_bm25", boom)
+    eng._ensure_loaded()
+    assert eng._bm25 is not None
+    assert eng._bm25.corpus_size == 3
+    assert rebuilt["called"] is False
+
+
+def test_bm25_state_sidecar_mismatch_falls_back_to_rebuild(tmp_data_dir, stub_embedder):
+    """Stale sidecar (corpus_size doesn't match chunk count) must be
+    detected and the engine falls back to rebuilding from SQLite — a
+    partial rebuild can never leave retrieval scoring against the wrong
+    BM25 state."""
+    from hybrid_rag.indexing import _build_bm25_state
+    store = Store()
+    arr = np.eye(3, 32, dtype=np.float32)
+    _seed_chunks(store, [10, 20, 30])
+    arts = ArtifactStore(store.data_dir)
+    arts.save(arr)
+    # Sidecar has the WRONG corpus size (5 instead of 3).
+    arts.save_bm25_state(_build_bm25_state(["a", "b", "c", "d", "e"]))
+
+    eng = RAGEngine(store=store, embedder=stub_embedder)
+    eng._ensure_loaded()
+    assert eng._bm25 is not None
+    # Rebuild path produced a BM25 sized to the real chunk count.
+    assert eng._bm25.corpus_size == 3
+
+
 def test_ensure_loaded_does_not_open_bm25_pickle(tmp_data_dir, stub_embedder):
     """Defense-in-depth: a leftover bm25.pkl from an old install (or a hostile
     plant) must never be deserialized. We rebuild from SQLite regardless."""
@@ -140,6 +190,55 @@ def test_store_connection_survives_cross_thread_use(tmp_data_dir, stub_embedder)
     # raises sqlite3.ProgrammingError.
     hits = eng.hybrid_search("chunk-0")
     assert isinstance(hits, list)
+
+
+def test_version_cache_skips_repeat_meta_reads(tmp_data_dir, stub_embedder, monkeypatch):
+    """The engine should not SELECT meta on every retrieval call. The cache
+    short-circuits while neither (a) `meta_write_seq` has changed nor (b)
+    the TTL has elapsed."""
+    store = Store()
+    _seed_chunks(store, [1, 2, 3])
+    arr = np.eye(3, 32, dtype=np.float32)
+    ArtifactStore(store.data_dir).save(arr)
+    store.set_meta("index_version", "v1")
+
+    eng = RAGEngine(store=store, embedder=stub_embedder)
+    eng._ensure_loaded()  # populates cache
+
+    # Spy on get_meta to count post-load reads.
+    real_get_meta = store.get_meta
+    calls = {"n": 0}
+
+    def counting(key):
+        calls["n"] += 1
+        return real_get_meta(key)
+
+    monkeypatch.setattr(store, "get_meta", counting)
+
+    # Several engine calls in a row — none should re-read meta.
+    for _ in range(10):
+        eng._ensure_loaded()
+    assert calls["n"] == 0, "version cache should suppress repeat meta reads"
+
+
+def test_version_cache_invalidates_on_same_process_write(tmp_data_dir, stub_embedder):
+    """A `set_meta` write in the same process bumps `meta_write_seq`, which
+    invalidates the engine's version cache immediately — no TTL wait."""
+    store = Store()
+    _seed_chunks(store, [1, 2, 3])
+    arr = np.eye(3, 32, dtype=np.float32)
+    ArtifactStore(store.data_dir).save(arr)
+    store.set_meta("index_version", "v1")
+
+    eng = RAGEngine(store=store, embedder=stub_embedder)
+    eng._ensure_loaded()
+    first_loaded = eng._loaded_version
+
+    # Same-process meta write should be observed on the next call.
+    store.set_meta("index_version", "v2")
+    eng._ensure_loaded()
+    assert eng._loaded_version == "v2"
+    assert eng._loaded_version != first_loaded
 
 
 def test_consistency_check_rejects_embedding_chunk_mismatch(tmp_data_dir, stub_embedder):

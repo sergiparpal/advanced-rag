@@ -148,6 +148,39 @@ def test_judge_parses_fenced_json(monkeypatch):
     assert "missing X" in out["reason"]
 
 
+def test_judge_and_reformulate_sufficient_path(monkeypatch):
+    """Sufficient verdict: no rewrite emitted, one LLM call total."""
+    state = _install_scripted_anthropic(monkeypatch, responses=[
+        '{"sufficient": true, "reason": "covered"}',
+    ])
+    out = crag_mod.judge_and_reformulate("q", [])
+    assert out["sufficient"] is True
+    assert out["rewritten_query"] is None
+    assert len(state["calls"]) == 1
+
+
+def test_judge_and_reformulate_insufficient_path(monkeypatch):
+    """Insufficient verdict: rewrite rides on the same response."""
+    state = _install_scripted_anthropic(monkeypatch, responses=[
+        '{"sufficient": false, "reason": "missing", '
+        '"rewritten_query": "better phrasing"}',
+    ])
+    out = crag_mod.judge_and_reformulate("q", [])
+    assert out["sufficient"] is False
+    assert out["rewritten_query"] == "better phrasing"
+    assert "missing" in out["reason"]
+    assert len(state["calls"]) == 1
+
+
+def test_judge_and_reformulate_no_api_key_is_noop(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    _anthropic.reset_for_tests()
+    out = crag_mod.judge_and_reformulate("q", [])
+    # Fail-open: caller treats this as no retry.
+    assert out["sufficient"] is True
+    assert out["rewritten_query"] is None
+
+
 def test_judge_swallows_sdk_error(monkeypatch):
     mod = types.ModuleType("anthropic")
 
@@ -192,12 +225,14 @@ def test_crag_sufficient_no_retry(warmed_engine, monkeypatch):
         # First call to /messages on the search path is query expansion —
         # return valid JSON so expansion can proceed.
         '{"paraphrases": [], "hyde": ""}',
-        # Second call is CRAG judge — verdict: sufficient.
+        # Second call is the merged CRAG judge+reformulate — sufficient
+        # response stops here (no rewrite needed).
         '{"sufficient": true, "reason": "complete coverage"}',
     ])
     out = json.loads(tool_rag_search({"query": "cosmic rays"}))
     assert out["crag_reformulated_query"] is None
     assert out["crag_reason"] is None
+    assert len(state["calls"]) == 2
 
 
 def test_crag_insufficient_triggers_one_retry(warmed_engine, monkeypatch):
@@ -205,30 +240,30 @@ def test_crag_insufficient_triggers_one_retry(warmed_engine, monkeypatch):
     state = _install_scripted_anthropic(monkeypatch, responses=[
         # 1st: expansion on original query.
         '{"paraphrases": [], "hyde": ""}',
-        # 2nd: CRAG judge → insufficient.
-        '{"sufficient": false, "reason": "no cosmic context"}',
-        # 3rd: reformulation.
-        "cosmic ray atmospheric showers",
-        # 4th: expansion on reformulated query.
+        # 2nd: merged judge+reformulate. The rewritten query rides in the
+        # same response — A2 collapsed two LLM calls into one.
+        '{"sufficient": false, "reason": "no cosmic context", '
+        '"rewritten_query": "cosmic ray atmospheric showers"}',
+        # 3rd: expansion on reformulated query.
         '{"paraphrases": [], "hyde": ""}',
         # No second judge — hard cap one retry.
     ])
     out = json.loads(tool_rag_search({"query": "cosmic rays"}))
     assert out["crag_reformulated_query"] == "cosmic ray atmospheric showers"
     assert "no cosmic context" in (out["crag_reason"] or "")
-    # Exactly one retry → exactly 4 Anthropic calls.
-    assert len(state["calls"]) == 4
+    # One judge + one reformulate previously cost 4 calls (expand, judge,
+    # reformulate, expand-retry); the merged shape brings it down to 3.
+    assert len(state["calls"]) == 3
 
 
 def test_crag_reformulation_failure_returns_first_pass(warmed_engine, monkeypatch):
-    """If reformulation returns empty / fails, the caller falls back to the
-    first-pass results — no retry."""
+    """If the merged call returns insufficient but no usable rewrite, the
+    caller falls back to the first-pass results — no retry."""
     monkeypatch.setenv("HERMES_RAG_CRAG", "1")
     _install_scripted_anthropic(monkeypatch, responses=[
         '{"paraphrases": [], "hyde": ""}',
-        '{"sufficient": false, "reason": "thin"}',
-        # Empty reformulation → None
-        "",
+        # Empty rewritten_query → treated as "no rewrite available".
+        '{"sufficient": false, "reason": "thin", "rewritten_query": ""}',
     ])
     out = json.loads(tool_rag_search({"query": "cosmic rays"}))
     assert out["crag_reformulated_query"] is None
@@ -257,9 +292,11 @@ def test_ambient_path_never_invokes_crag(warmed_engine, monkeypatch,
 
     judge_calls = {"n": 0}
     reformulate_calls = {"n": 0}
+    merged_calls = {"n": 0}
 
     real_judge = crag_mod.judge_retrieval
     real_reformulate = crag_mod.reformulate_query
+    real_merged = crag_mod.judge_and_reformulate
 
     def spy_judge(*a, **kw):
         judge_calls["n"] += 1
@@ -269,8 +306,13 @@ def test_ambient_path_never_invokes_crag(warmed_engine, monkeypatch,
         reformulate_calls["n"] += 1
         return real_reformulate(*a, **kw)
 
+    def spy_merged(*a, **kw):
+        merged_calls["n"] += 1
+        return real_merged(*a, **kw)
+
     monkeypatch.setattr(crag_mod, "judge_retrieval", spy_judge)
     monkeypatch.setattr(crag_mod, "reformulate_query", spy_reformulate)
+    monkeypatch.setattr(crag_mod, "judge_and_reformulate", spy_merged)
 
     mock_cross_encoder._scores = [5.0] * 10
     out = ambient_pre_llm_call(
@@ -280,3 +322,4 @@ def test_ambient_path_never_invokes_crag(warmed_engine, monkeypatch,
     assert out is not None  # ambient still works
     assert judge_calls["n"] == 0
     assert reformulate_calls["n"] == 0
+    assert merged_calls["n"] == 0

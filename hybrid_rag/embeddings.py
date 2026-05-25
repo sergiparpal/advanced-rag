@@ -7,6 +7,7 @@ Tests inject a stub embedder rather than this real one — keeps
 from __future__ import annotations
 
 import os
+import threading
 
 import numpy as np
 
@@ -60,6 +61,11 @@ class Embedder:
         # table > auto-detect on first encode.
         env_dim = get_embed_dim() if dim is None else dim
         self._dim: int | None = env_dim if env_dim else EMBED_MODEL_DIMS.get(self._model_name)
+        # Serializes the lazy model load so concurrent first-callers (e.g.
+        # the explicit pipeline's parallel variant search) don't each kick
+        # off their own `SentenceTransformer(...)` construction — that's
+        # ~80 MB of duplicate weights and ~1-3 s of wasted CPU.
+        self._load_lock = threading.Lock()
 
     @property
     def model_name(self) -> str:
@@ -73,25 +79,34 @@ class Embedder:
         return self._dim
 
     def _load_model(self):
+        # Double-checked locking. Fast path: model already loaded, no lock.
+        # Slow path: acquire the lock so only one thread runs the import +
+        # constructor; others wait and then re-check.
         if self._model is not None:
             return self._model
-        from sentence_transformers import SentenceTransformer
-        self._model = SentenceTransformer(self._model_name)
-        # Discover the real dim once and remember it. Models we don't know
-        # up front (any user-supplied id) get auto-registered here.
-        try:
-            real = int(self._model.get_sentence_embedding_dimension())
-        except Exception:
-            real = None
-        if real:
-            if self._dim and self._dim != real:
-                raise RuntimeError(
-                    f"HERMES_RAG_EMBED_DIM={self._dim} disagrees with model "
-                    f"{self._model_name!r} actual dim {real}. Unset the env "
-                    "var or re-run `hermes rag index --force`."
-                )
-            self._dim = real
-        return self._model
+        with self._load_lock:
+            if self._model is not None:
+                return self._model
+            from sentence_transformers import SentenceTransformer
+            model = SentenceTransformer(self._model_name)
+            # Discover the real dim once and remember it. Models we don't know
+            # up front (any user-supplied id) get auto-registered here.
+            try:
+                real = int(model.get_sentence_embedding_dimension())
+            except Exception:
+                real = None
+            if real:
+                if self._dim and self._dim != real:
+                    raise RuntimeError(
+                        f"HERMES_RAG_EMBED_DIM={self._dim} disagrees with model "
+                        f"{self._model_name!r} actual dim {real}. Unset the env "
+                        "var or re-run `hermes rag index --force`."
+                    )
+                self._dim = real
+            # Publish last so a partially-initialized instance is never
+            # visible to other threads.
+            self._model = model
+            return self._model
 
     def encode(self, texts: list[str], batch_size: int = 64) -> np.ndarray:
         if not texts:

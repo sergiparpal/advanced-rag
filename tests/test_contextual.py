@@ -188,7 +188,11 @@ def test_contextual_on_writes_prefix_and_composed_text(
         assert r["contextual_prefix"] == "situated context"
         # Composition rule: prefix + "\n\n" + chunk.
         assert r["text_for_embedding"] == "situated context\n\n" + r["text"]
-        assert r["text_for_bm25"] == r["text_for_embedding"]
+        # `text_for_bm25` is left NULL when it would equal `text_for_embedding`
+        # — readers fall through (see `ChunkRow.effective_bm25_text`). Saves
+        # a copy on disk and keeps the column reserved for future cases that
+        # need a BM25-only variant.
+        assert r["text_for_bm25"] is None
 
 
 def test_anthropic_failure_during_indexing_does_not_abort(

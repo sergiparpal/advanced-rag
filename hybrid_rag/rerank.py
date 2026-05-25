@@ -19,6 +19,15 @@ from .models import ParentResult
 RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 COHERE_RERANK_MODEL = "rerank-english-v3.0"
 
+# Per-parent text length capped before scoring. The cross-encoder is
+# trained on ~512-token passages; feeding 2000 chars just lets the model
+# internally truncate at a higher cost. The explicit `rag_search` path
+# uses the wider cap so longer context can sway the score — it pays the
+# Cohere round-trip anyway. The ambient path runs every turn and must
+# stay cheap, so it sets a tighter cap (`AMBIENT_RERANK_TEXT_CHARS`).
+DEFAULT_RERANK_TEXT_CHARS = 2000
+AMBIENT_RERANK_TEXT_CHARS = 512
+
 log = logging.getLogger(__name__)
 
 _CROSS = None  # module-level cache for the local cross-encoder
@@ -71,13 +80,19 @@ def _try_cohere(query: str, parents: list[ParentResult], top_k: int) -> list[Par
         return None
 
 
-def _try_local_cross_encoder(query: str, parents: list[ParentResult], top_k: int) -> list[ParentResult] | None:
+def _try_local_cross_encoder(
+    query: str,
+    parents: list[ParentResult],
+    top_k: int,
+    *,
+    text_cap: int = DEFAULT_RERANK_TEXT_CHARS,
+) -> list[ParentResult] | None:
     global _CROSS
     try:
         if _CROSS is None:
             from sentence_transformers import CrossEncoder
             _CROSS = CrossEncoder(RERANK_MODEL)
-        pairs = [(query, p.text[:2000]) for p in parents]
+        pairs = [(query, p.text[:text_cap]) for p in parents]
         scores = _CROSS.predict(pairs)
         ranked = sorted(
             zip(parents, scores), key=itemgetter(1), reverse=True,
@@ -88,13 +103,22 @@ def _try_local_cross_encoder(query: str, parents: list[ParentResult], top_k: int
         return None
 
 
-def rerank(query: str, parents: list[ParentResult], top_k: int) -> list[ParentResult]:
+def rerank(
+    query: str,
+    parents: list[ParentResult],
+    top_k: int,
+    *,
+    text_cap: int = DEFAULT_RERANK_TEXT_CHARS,
+) -> list[ParentResult]:
     """Rerank `parents` by relevance to `query` and return the top `top_k`.
 
     Non-mutating: returned ``ParentResult`` objects are fresh copies — the
     input list and its elements are untouched. Callers running multiple
     rerank passes (A/B model comparison) can pass the same list twice
     without stale scores leaking across calls.
+
+    ``text_cap`` only affects the local cross-encoder fallback; Cohere
+    sees full text because it does its own internal chunking server-side.
     """
     if not parents:
         return []
@@ -103,7 +127,7 @@ def rerank(query: str, parents: list[ParentResult], top_k: int) -> list[ParentRe
     # through to the local reranker rather than hand the user back nothing.
     if cohere_out:
         return cohere_out
-    local_out = _try_local_cross_encoder(query, parents, top_k)
+    local_out = _try_local_cross_encoder(query, parents, top_k, text_cap=text_cap)
     if local_out:
         return local_out
     # Identity fallback. Still return fresh copies so the contract holds
@@ -111,17 +135,24 @@ def rerank(query: str, parents: list[ParentResult], top_k: int) -> list[ParentRe
     return [_scored(p, None) for p in parents[:top_k]]
 
 
-def rerank_local(query: str, parents: list[ParentResult], top_k: int) -> list[ParentResult]:
+def rerank_local(
+    query: str,
+    parents: list[ParentResult],
+    top_k: int,
+    *,
+    text_cap: int = DEFAULT_RERANK_TEXT_CHARS,
+) -> list[ParentResult]:
     """Local-cross-encoder-only variant used by the **ambient** path.
 
     Cohere is intentionally never called from the ambient path: a per-turn
     HTTP round-trip would defeat the purpose of the cheap injection layer.
     The explicit `rag_search` path keeps using `rerank` (Cohere → local →
-    identity).
+    identity). Ambient callers pass `text_cap=AMBIENT_RERANK_TEXT_CHARS`
+    to keep per-turn scoring cheap.
     """
     if not parents:
         return []
-    local_out = _try_local_cross_encoder(query, parents, top_k)
+    local_out = _try_local_cross_encoder(query, parents, top_k, text_cap=text_cap)
     if local_out:
         return local_out
     return [_scored(p, None) for p in parents[:top_k]]

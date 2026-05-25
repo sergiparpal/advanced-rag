@@ -163,6 +163,108 @@ def test_list_sources_ignores_args(warmed_engine):
 
 # ---------- explicit injection ----------
 
+def test_search_runs_variants_in_parallel(tmp_data_dir, tmp_path, stub_embedder, monkeypatch):
+    """When expansion produces multiple variants, the pipeline must fan
+    them out across worker threads. We assert this by counting how many
+    distinct threads actually invoked `hybrid_search_chunk_ids`. Pre-S2
+    behavior would show exactly one thread (the caller's)."""
+    import threading
+    import sys
+    import types
+    from hybrid_rag import _anthropic, pipelines as pipelines_mod
+
+    # Install an anthropic mock so expansion yields 5 variants.
+    mod = types.ModuleType("anthropic")
+
+    class _Msg:
+        def __init__(self, text):
+            self.content = [types.SimpleNamespace(text=text)]
+
+    class _Messages:
+        def create(self, **kw):
+            return _Msg('{"paraphrases":["a","b","c"],"hyde":"h"}')
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            self.messages = _Messages()
+
+    mod.Anthropic = _Client
+    monkeypatch.setitem(sys.modules, "anthropic", mod)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.delenv("COHERE_API_KEY", raising=False)
+    _anthropic.reset_for_tests()
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "x.md").write_text("# T\n\n## Section\nQuick brown fox jumps.")
+    store = Store()
+    index_path(docs, store=store, embedder=stub_embedder)
+    eng = RAGEngine(store=store, embedder=stub_embedder)
+    eng._ensure_loaded()
+
+    threads_seen: set[int] = set()
+    real = eng.hybrid_search_chunk_ids
+    lock = threading.Lock()
+
+    def spy(q, **kw):
+        with lock:
+            threads_seen.add(threading.get_ident())
+        # Hold each worker briefly so the pool actually has to spawn
+        # additional threads to make progress. Without this stall the
+        # tiny stub-embedder workload completes on a single worker
+        # serially — the parallel path is still TAKEN, but the test
+        # can't observe it.
+        import time as _t
+        _t.sleep(0.02)
+        return real(q, **kw)
+
+    monkeypatch.setattr(eng, "hybrid_search_chunk_ids", spy)
+
+    pipelines_mod.ExplicitPipeline(eng).run("cosmic rays particles", 3)
+    # Expansion produced ≥2 variants, so the pool must have used ≥2 threads.
+    assert len(threads_seen) >= 2, (
+        f"variant search ran on only {len(threads_seen)} thread(s) — "
+        f"expected parallel fan-out"
+    )
+
+
+def test_search_dedupes_byte_identical_variants(tmp_data_dir, tmp_path,
+                                                  stub_embedder, monkeypatch):
+    """B4 defense: if expansion ever produces byte-identical variants,
+    `_search_variants` must run the search exactly once per unique
+    string. We force the situation by monkey-patching `expand_query` and
+    counting calls into the engine."""
+    import sys
+    import types
+    from hybrid_rag import _anthropic, expansion, pipelines as pipelines_mod
+
+    # Indexing.
+    monkeypatch.delenv("COHERE_API_KEY", raising=False)
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "x.md").write_text("# T\n\n## Section\nQuick brown fox jumps.")
+    store = Store()
+    index_path(docs, store=store, embedder=stub_embedder)
+    eng = RAGEngine(store=store, embedder=stub_embedder)
+    eng._ensure_loaded()
+
+    # Force 4 variants where two are byte-identical.
+    monkeypatch.setattr(expansion, "expand_query",
+                        lambda q: [q, "alt-A", q, "alt-A"])
+
+    calls: list[str] = []
+    real = eng.hybrid_search_chunk_ids
+
+    def spy(q, **kw):
+        calls.append(q)
+        return real(q, **kw)
+
+    monkeypatch.setattr(eng, "hybrid_search_chunk_ids", spy)
+    pipelines_mod.ExplicitPipeline(eng).run("cosmic", 3)
+    # 4 variants in, but only 2 unique → exactly 2 engine calls.
+    assert sorted(calls) == sorted({"cosmic", "alt-A"})
+
+
 def test_search_accepts_explicit_engine(tmp_data_dir, tmp_path, stub_embedder, monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("COHERE_API_KEY", raising=False)

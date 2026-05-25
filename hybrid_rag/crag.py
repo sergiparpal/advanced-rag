@@ -41,6 +41,21 @@ _REFORMULATE_PROMPT = (
     "explanation, no quotes."
 )
 
+_JUDGE_AND_REFORMULATE_PROMPT = (
+    "You are evaluating whether retrieved document excerpts are sufficient "
+    "to answer a user's query, and rewriting the query if they are not.\n\n"
+    "Query: {q}\n\n"
+    "Retrieved excerpts:\n{excerpts}\n\n"
+    "Respond with a single JSON object (no surrounding text, no code "
+    "fences). Two shapes:\n\n"
+    "Sufficient — the excerpts can answer the query:\n"
+    '  {{"sufficient": true, "reason": "<one sentence>"}}\n\n'
+    "Insufficient — supply a rewritten query (≤25 words, no quotes) that "
+    "would be more likely to retrieve the missing evidence:\n"
+    '  {{"sufficient": false, "reason": "<one sentence>", '
+    '"rewritten_query": "<the rewrite>"}}'
+)
+
 _WHITESPACE_RE = re.compile(r"\s+")
 # Hard cap on the rewritten query length. The prompt asks for ≤25 words; this
 # is a defense-in-depth bound that also rejects an LLM that returns a wall of
@@ -98,6 +113,74 @@ def judge_retrieval(
         return {"sufficient": True, "reason": f"judge failed: {e!r}"}
 
 
+def _clean_rewritten_query(text: str) -> str | None:
+    """Trim a model's rewritten-query output. Returns None for empty,
+    overlong, or otherwise unusable values — the caller treats that as
+    "no retry" rather than feeding garbage into BM25."""
+    # Strip whatever the model wrapped the rewrite in: ASCII quotes,
+    # backticks, smart quotes (U+2018-201D), and surrounding whitespace.
+    text = text.strip("\"' \n\t`‘’“”")
+    # Collapse any internal whitespace (newlines, tabs) into single spaces
+    # — the rewritten query is fed into BM25 tokenization, so multi-line
+    # noise just dilutes the score.
+    text = _WHITESPACE_RE.sub(" ", text).strip()
+    if not text or len(text) > _REFORMULATED_MAX_CHARS:
+        return None
+    return text
+
+
+def judge_and_reformulate(
+    query: str,
+    parents: list[ParentResult],
+    *,
+    client=None,
+    model: str = ANTHROPIC_MODEL,
+) -> dict:
+    """Single-call CRAG: judge sufficiency AND, if insufficient, return a
+    rewritten query in one round-trip.
+
+    Returns ``{"sufficient": bool, "reason": str, "rewritten_query": str|None}``.
+
+    Trade-off vs. the two-call ``judge_retrieval`` + ``reformulate_query``
+    cascade: one HTTP round-trip instead of two — usually ~500 ms saved on
+    the CRAG-enabled path. The downside is a slightly longer prompt that
+    always asks for both shapes, even when the judge would say sufficient.
+    Net savings hold because the model decides early and only emits the
+    rewrite when needed.
+
+    On any failure (no API key, no SDK, network error, malformed response)
+    returns ``{"sufficient": True, "reason": "<details>",
+    "rewritten_query": None}`` so the caller treats CRAG as a no-op.
+    """
+    cli = client if client is not None else _anthropic.get_client()
+    if cli is None:
+        return {"sufficient": True, "reason": "anthropic unavailable",
+                "rewritten_query": None}
+
+    excerpts = _excerpt_block(parents)
+    try:
+        msg = cli.messages.create(
+            model=model,
+            max_tokens=384,
+            messages=[{"role": "user",
+                       "content": _JUDGE_AND_REFORMULATE_PROMPT.format(
+                           q=query, excerpts=excerpts)}],
+        )
+        payload = json.loads(_anthropic.strip_json_fences(_anthropic.extract_text(msg)))
+        sufficient = bool(payload.get("sufficient", True))
+        reason = str(payload.get("reason", ""))
+        rewritten = payload.get("rewritten_query")
+        if sufficient or not isinstance(rewritten, str):
+            return {"sufficient": sufficient, "reason": reason,
+                    "rewritten_query": None}
+        return {"sufficient": False, "reason": reason,
+                "rewritten_query": _clean_rewritten_query(rewritten)}
+    except Exception as e:
+        log.warning("CRAG judge_and_reformulate failed: %s", e)
+        return {"sufficient": True, "reason": f"call failed: {e!r}",
+                "rewritten_query": None}
+
+
 def reformulate_query(
     query: str,
     parents: list[ParentResult],
@@ -121,18 +204,7 @@ def reformulate_query(
                            q=query,
                            reason=judge_reason or "(no reason given)")}],
         )
-        text = _anthropic.extract_text(msg).strip()
-        # Strip whatever the model wrapped the rewrite in: ASCII quotes,
-        # backticks, smart quotes (U+2018-201D), and surrounding whitespace.
-        # The prompt asks for the query alone, but Haiku occasionally wraps it.
-        text = text.strip("\"' \n\t`‘’“”")
-        # Collapse any internal whitespace (newlines, tabs) into single
-        # spaces — the rewritten query is fed back into retrieval and BM25
-        # tokenization, so multi-line garbage here just adds noise.
-        text = _WHITESPACE_RE.sub(" ", text).strip()
-        if not text or len(text) > _REFORMULATED_MAX_CHARS:
-            return None
-        return text
+        return _clean_rewritten_query(_anthropic.extract_text(msg).strip())
     except Exception as e:
         log.warning("CRAG reformulate failed: %s", e)
         return None

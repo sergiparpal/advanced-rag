@@ -103,20 +103,20 @@ def _extract_parents(path: Path) -> list[Parent]:
 # --- per-file write helpers ----------------------------------------------
 
 
-def _persist_file_row(store: Store, path: Path) -> int:
+def _persist_file_row(store: Store, path: Path, *, conn=None) -> int:
     """Insert one `files` row and return its id."""
     st = path.stat()
     row = (str(path), st.st_mtime, st.st_size, _hash_file(path),
            path.suffix.lower().lstrip("."), time.time())
-    return store.bulk_insert_files([row])[str(path)]
+    return store.bulk_insert_files([row], conn=conn)[str(path)]
 
 
 def _persist_parent_rows(store: Store, file_id: int,
-                         parents: list[Parent]) -> list[int]:
+                         parents: list[Parent], *, conn=None) -> list[int]:
     """Insert `parents` rows under `file_id`, return ids in input order."""
     rows = [(file_id, i, p.kind, p.title, p.page_no, p.text, len(p.text))
             for i, p in enumerate(parents)]
-    return store.bulk_insert_parents(rows)
+    return store.bulk_insert_parents(rows, conn=conn)
 
 
 def _generate_contextual_prefixes(
@@ -139,7 +139,7 @@ def _generate_contextual_prefixes(
 
 
 def _chunk_one_parent(store: Store, parent_id: int, parent: Parent,
-                      *, use_contextual: bool) -> int:
+                      *, use_contextual: bool, conn=None) -> int:
     """Split `parent` into chunks, optionally generate contextual prefixes,
     insert into `chunks`. Returns the number of rows inserted (0 if the
     parent yielded no usable pieces)."""
@@ -162,33 +162,37 @@ def _chunk_one_parent(store: Store, parent_id: int, parent: Parent,
     for ord_, (piece, prefix) in enumerate(zip(pieces, prefixes)):
         if prefix:
             composed = prefix + "\n\n" + piece
+            # `text_for_bm25` is left NULL when it equals `text_for_embedding`
+            # — readers fall through (see `ChunkRow.effective_bm25_text`).
+            # Saves one copy per chunk on disk; today BM25 and dense always
+            # use the same composed text under contextual retrieval.
             chunk_rows.append(
-                (parent_id, ord_, piece, 0, prefix, composed, composed)
+                (parent_id, ord_, piece, 0, prefix, composed, None)
             )
         else:
             chunk_rows.append((parent_id, ord_, piece, 0, None, None, None))
-    store.bulk_insert_chunks(chunk_rows)
+    store.bulk_insert_chunks(chunk_rows, conn=conn)
     return len(chunk_rows)
 
 
-def _index_file(store: Store, path: Path) -> tuple[int, int, int]:
+def _index_file(store: Store, path: Path, *, conn=None) -> tuple[int, int, int]:
     """Insert one file's parents and chunks. Returns (file_id, parent_count,
     chunk_count). Caller is responsible for picking up an existing file row's
     deletion before calling this."""
     raw_parents = _extract_parents(path)
     parents = _enforce_parent_cap(raw_parents)
 
-    file_id = _persist_file_row(store, path)
+    file_id = _persist_file_row(store, path, conn=conn)
     if not parents:
         return file_id, 0, 0
 
-    parent_ids = _persist_parent_rows(store, file_id, parents)
+    parent_ids = _persist_parent_rows(store, file_id, parents, conn=conn)
     use_contextual = contextual.is_contextual_enabled()
 
     chunk_count = 0
     for pid, parent in zip(parent_ids, parents):
         chunk_count += _chunk_one_parent(
-            store, pid, parent, use_contextual=use_contextual,
+            store, pid, parent, use_contextual=use_contextual, conn=conn,
         )
     return file_id, len(parents), chunk_count
 
@@ -226,22 +230,36 @@ def _compute_changeset(store: Store, files: list[Path], diff: dict,
 
 
 def _apply_inserts(store: Store, paths: list[Path]) -> tuple[int, int, int]:
-    """Index each path; skip-with-log on failure. Returns
-    (files, parents, chunks) totals."""
-    files = parents = chunks = 0
-    for p in paths:
-        try:
-            _, pn, cn = _index_file(store, p)
-        except Exception as e:
-            # Skip the file but keep going. Warning goes to stderr so the
-            # CLI's JSON summary on stdout stays parseable.
-            log.warning("failed to index %s: %s", p, e)
-            print(f"[hybrid-rag] failed to index {p}: {e}", file=sys.stderr)
-            continue
-        files += 1
-        parents += pn
-        chunks += cn
-    return files, parents, chunks
+    """Index each path under one outer transaction with per-file savepoints.
+
+    Pre-A1 behavior: each file opened three independent transactions (one
+    per `bulk_insert_*` call) — so a 1000-file index did ~3000 fsyncs even
+    in WAL mode. Now the whole batch is one transaction, and a file that
+    fails mid-way rolls back via its savepoint without affecting the
+    successful files. Net: O(N) commits collapse to O(1).
+
+    Returns (files, parents, chunks) totals.
+    """
+    files = parents_total = chunks = 0
+    if not paths:
+        return 0, 0, 0
+    with store.transaction() as conn:
+        for p in paths:
+            try:
+                with store.savepoint("file"):
+                    _, pn, cn = _index_file(store, p, conn=conn)
+            except Exception as e:
+                # Savepoint rolled back this file's partial rows; the other
+                # successful files in the same outer transaction still
+                # commit at the end. Warning to stderr so the CLI's JSON
+                # summary on stdout stays parseable.
+                log.warning("failed to index %s: %s", p, e)
+                print(f"[hybrid-rag] failed to index {p}: {e}", file=sys.stderr)
+                continue
+            files += 1
+            parents_total += pn
+            chunks += cn
+    return files, parents_total, chunks
 
 
 def index_path(path, force: bool = False, store: Store | None = None,
@@ -290,10 +308,42 @@ def index_path(path, force: bool = False, store: Store | None = None,
     }
 
 
+def _build_bm25_state(bm25_texts: list[str]) -> dict:
+    """Build a BM25Okapi over `bm25_texts` and serialize its state to a
+    JSON-safe dict.
+
+    The dict is the exact set of attributes our `rank_bm25.BM25Okapi`
+    reconstruction in `engine.py` expects — keep the two in lockstep
+    when the shape changes.
+    """
+    from rank_bm25 import BM25Okapi
+
+    from .retrieval import _tokenize
+
+    tokenized = [_tokenize(t) for t in bm25_texts]
+    bm25 = BM25Okapi(tokenized)
+    return {
+        "corpus_size": int(bm25.corpus_size),
+        "avgdl": float(bm25.avgdl),
+        "average_idf": float(bm25.average_idf),
+        "k1": float(bm25.k1),
+        "b": float(bm25.b),
+        "epsilon": float(bm25.epsilon),
+        # `doc_freqs` is a list of per-doc {term: freq} dicts. JSON
+        # round-trips this losslessly (all keys are tokenizer-emitted
+        # ASCII strings, all values are ints).
+        "doc_freqs": [dict(d) for d in bm25.doc_freqs],
+        "idf": dict(bm25.idf),
+        "doc_len": [int(x) for x in bm25.doc_len],
+    }
+
+
 def rebuild_artifacts(store: Store, embedder) -> None:
-    """Rebuild embeddings.npz from the canonical SQLite chunk order. Also
-    rewrites each chunk's ``embed_row`` so row N of the embeddings array
-    maps to chunk_ids[N]. BM25 is no longer persisted — see storage.py."""
+    """Rebuild embeddings.npz and the BM25 sidecar from the canonical
+    SQLite chunk order. Also rewrites each chunk's ``embed_row`` so row N
+    of the embeddings array maps to chunk_ids[N]. Persisting the BM25
+    state at index time means engine load is a JSON decode (~100 ms on
+    100K chunks) instead of a re-tokenize + re-build (1-3 s)."""
     rows = list(store.iter_chunks_ordered())
     artifacts = ArtifactStore(store.data_dir)
     artifacts.unlink_legacy_bm25()
@@ -303,6 +353,7 @@ def rebuild_artifacts(store: Store, embedder) -> None:
         return
 
     embed_texts = [r.effective_embedding_text for r in rows]
+    bm25_texts = [r.effective_bm25_text for r in rows]
     chunk_ids = [r.id for r in rows]
 
     embeddings = embedder.encode(embed_texts)
@@ -310,6 +361,7 @@ def rebuild_artifacts(store: Store, embedder) -> None:
         raise RuntimeError("embedder returned wrong number of vectors")
 
     artifacts.save(embeddings)
+    artifacts.save_bm25_state(_build_bm25_state(bm25_texts))
     store.bulk_update_embed_rows([(cid, row) for row, cid in enumerate(chunk_ids)])
 
     model_name = getattr(embedder, "model_name", None) or "unknown"

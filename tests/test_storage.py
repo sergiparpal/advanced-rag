@@ -36,18 +36,21 @@ def test_cascade_delete_kills_parents_and_chunks(tmp_data_dir):
 
 
 def test_iter_bm25_texts_prefers_contextual(tmp_data_dir):
-    """When text_for_bm25 is present it shadows the raw chunk text;
-    otherwise the raw text is yielded. The engine builds BM25 from this
-    stream — pickle is gone, the only persistent BM25 source is SQLite."""
+    """Three-level fallback: text_for_bm25 > text_for_embedding > raw text.
+    The middle rung lets the indexer dedupe — when BM25 text equals
+    embedding text (always true under contextual retrieval today), only
+    `text_for_embedding` is populated and `text_for_bm25` stays NULL.
+    """
     store = Store()
     fid = store.bulk_insert_files([("/x.md", 0.0, 0, "h", "md", 0.0)])["/x.md"]
     pid = store.bulk_insert_parents([(fid, 0, "section", "T", None, "x", 1)])[0]
     store.bulk_insert_chunks([
-        (pid, 0, "raw-zero", 0, None, None, None),  # no text_for_bm25 → raw text
-        (pid, 1, "raw-one", 0, "prefix", "raw-one-embed", "composed-one"),
+        (pid, 0, "raw-zero", 0, None, None, None),       # raw fallback
+        (pid, 1, "raw-one", 0, "prefix", "embed-one", None),  # uses embedding
+        (pid, 2, "raw-two", 0, "prefix", "embed-two", "composed-two"),  # explicit bm25
     ])
     out = list(store.iter_bm25_texts_ordered())
-    assert out == ["raw-zero", "composed-one"]
+    assert out == ["raw-zero", "embed-one", "composed-two"]
 
 
 def test_parent_ids_for_chunks_batched(tmp_data_dir):
@@ -68,6 +71,23 @@ def test_parent_ids_for_chunks_batched(tmp_data_dir):
     assert 999_999 not in out
     # empty input returns empty dict, no SQL roundtrip
     assert store.parent_ids_for_chunks([]) == {}
+
+
+def test_get_parents_truncates_text_when_capped(tmp_data_dir):
+    """B5: the rerank-pool fetch should only read SUBSTR(text, 1, cap)
+    so we don't pay for full bodies on parents that won't survive
+    rerank. Survivors get rehydrated separately."""
+    store = Store()
+    fid = store.bulk_insert_files([("/x.md", 0.0, 0, "h", "md", 0.0)])["/x.md"]
+    big = "y" * 8000
+    p1 = store.bulk_insert_parents([
+        (fid, 0, "section", "T1", None, big, len(big)),
+    ])[0]
+    rows = store.get_parents([p1], text_cap=500)
+    assert len(rows[p1]["text"]) == 500
+    # Full fetch (no cap) returns the whole body.
+    rows_full = store.get_parents([p1])
+    assert len(rows_full[p1]["text"]) == 8000
 
 
 def test_get_parents_batched(tmp_data_dir):

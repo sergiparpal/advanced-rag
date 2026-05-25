@@ -20,12 +20,20 @@ guard + ``AmbientPipeline.run``.
 from __future__ import annotations
 
 import heapq
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from operator import itemgetter
 
 from . import convo, crag, expansion, formatting, rerank, retrieval
 from .config import RAG_SEARCH_CHUNK_POOL, RAG_SEARCH_PARENT_POOL
 from .models import Hit, ParentResult
+
+# Cap on the worker threads used to fan out variant searches in
+# `ExplicitPipeline._one_pass`. Past 5 the marginal benefit fades — the
+# default expansion produces 5 variants (q + 3 paraphrases + HyDE), and
+# the per-variant work is dominated by a numpy matmul that already uses
+# multiple BLAS threads under the covers.
+_VARIANT_WORKER_CAP = 5
 
 # --- Ambient tunables (consumer is the AmbientPipeline below) ---
 
@@ -62,15 +70,17 @@ class ExplicitPipeline:
         if not (crag.is_enabled() and first.parents):
             return first
 
-        verdict = crag.judge_retrieval(query, first.parents)
+        # One LLM call instead of the historical two (judge then
+        # reformulate). The merged shape lets the model either declare
+        # "sufficient" and stop, or emit the rewrite in the same response.
+        # ~500 ms saved on the CRAG-enabled path; behavior unchanged on
+        # failure paths (sufficient=True, no retry).
+        verdict = crag.judge_and_reformulate(query, first.parents)
         if verdict.get("sufficient", True):
             return first
 
-        # The judge said "not sufficient" — the reason is surfaced to the
-        # caller regardless of whether reformulation succeeds. Useful for
-        # logging when the retry can't run.
         reason = verdict.get("reason", "")
-        new_q = crag.reformulate_query(query, first.parents, reason)
+        new_q = verdict.get("rewritten_query")
         if not (new_q and new_q.strip() and new_q.strip() != query.strip()):
             return ExplicitResult(
                 parents=first.parents,
@@ -87,16 +97,52 @@ class ExplicitPipeline:
             crag_reason=reason,
         )
 
+    def _search_variants(self, variants: list[str]) -> list[list[int]]:
+        """Run `hybrid_search_chunk_ids` for each variant. The variants are
+        independent — different query strings, same engine state — so we
+        fan out across a thread pool. numpy releases the GIL during the
+        cosine matmul and BM25's inner ops, so this gives near-linear
+        speedup up to the BLAS-thread cap.
+
+        Pre-dedupe by literal query string before fanning out. Expansion
+        already dedupes case-insensitively, so in steady state every
+        variant is unique and this short-circuit is a no-op. The point is
+        defense: a future tweak to `expand_query` (or a model that emits
+        byte-identical paraphrases) doesn't quietly cost an extra search.
+        Token-equivalent strings are NOT deduped here — they share BM25
+        rankings but diverge on the dense side.
+
+        The single-variant case skips the pool overhead (which is ~5 ms
+        of teardown when nothing is queued).
+        """
+        eng = self._engine
+        # dict.fromkeys preserves first-seen order and dedupes by exact key.
+        unique = list(dict.fromkeys(variants))
+
+        def _search(v):
+            return eng.hybrid_search_chunk_ids(v, k_pool=RAG_SEARCH_CHUNK_POOL)
+
+        if len(unique) <= 1:
+            by_query = {v: _search(v) for v in unique}
+        else:
+            with ThreadPoolExecutor(
+                max_workers=min(len(unique), _VARIANT_WORKER_CAP),
+            ) as ex:
+                results = list(ex.map(_search, unique))
+            by_query = dict(zip(unique, results))
+
+        return [by_query[v] for v in variants]
+
     def _one_pass(self, query: str, k: int) -> ExplicitResult:
         """Single expansion → hybrid → fusion → rollup → rerank pass."""
         eng = self._engine
         store = eng.store
 
         variants = expansion.expand_query(query)
-        per_variant: list[list[int]] = []
-        for v in variants:
-            hits = eng.hybrid_search(v, k_pool=RAG_SEARCH_CHUNK_POOL)
-            per_variant.append([h.chunk_id for h in hits])
+        # `hybrid_search_chunk_ids` skips per-variant parent resolution —
+        # we only need the chunk rankings here for the second-level RRF.
+        # The parent IDs get resolved once below for the fused top list.
+        per_variant = self._search_variants(variants)
 
         fused = retrieval.rrf_fuse(per_variant)
         if not fused:
@@ -116,10 +162,16 @@ class ExplicitPipeline:
             if (pid := parent_by_chunk.get(cid)) is not None
         ]
 
+        # Rerank-pool stage gets truncated text — most of these parents
+        # won't survive the rerank cut, so reading their full bodies from
+        # SQLite is wasted I/O. The top-k that DO survive get rehydrated
+        # with full text below.
         parents = retrieval.chunks_to_parents(
             eng, materialized, top=RAG_SEARCH_PARENT_POOL,
+            text_cap=rerank.DEFAULT_RERANK_TEXT_CHARS,
         )
         reranked = rerank.rerank(query, parents, top_k=k)
+        reranked = retrieval.rehydrate_parent_text(eng, reranked)
         return ExplicitResult(parents=reranked, expansions_used=len(variants))
 
 
@@ -147,16 +199,24 @@ class AmbientPipeline:
         hits = self._search(user_message, session_id)
         if not hits:
             return None
+        # Rerank-pool fetch with the same tight text_cap the cross-encoder
+        # will consume below — no point reading more than the scorer can
+        # use. Survivors get rehydrated to full text before formatting so
+        # the injected context isn't artificially short.
         parents = retrieval.chunks_to_parents(
             engine, hits, top=AMBIENT_RERANK_POOL,
+            text_cap=rerank.AMBIENT_RERANK_TEXT_CHARS,
         )
         if not parents:
             return None
 
         # Local-only rerank — never Cohere on the per-turn path; an HTTP
-        # round-trip would defeat the cheap-injection premise.
+        # round-trip would defeat the cheap-injection premise. The
+        # ambient text cap is tighter than `rag_search`'s so the
+        # per-turn cross-encoder pass stays inside the latency budget.
         parents = rerank.rerank_local(
             user_message, parents, top_k=AMBIENT_TOP_PARENTS,
+            text_cap=rerank.AMBIENT_RERANK_TEXT_CHARS,
         )
         if not parents:
             return None
@@ -169,6 +229,10 @@ class AmbientPipeline:
         if parents[0].effective_score < AMBIENT_SCORE_THRESHOLD:
             return None
 
+        # Rehydrate full text now that we know which parents survived.
+        # `format_context` packs into AMBIENT_TOKEN_CAP — without this,
+        # the injected blocks would only carry the truncated rerank text.
+        parents = retrieval.rehydrate_parent_text(engine, parents)
         context = formatting.format_context(parents, token_cap=AMBIENT_TOKEN_CAP)
         return context or None
 

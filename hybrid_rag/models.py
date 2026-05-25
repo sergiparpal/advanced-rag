@@ -57,7 +57,12 @@ class ChunkRow:
 
     @property
     def effective_bm25_text(self) -> str:
-        return self.text_for_bm25 or self.text
+        """Three-level fallback. When contextual retrieval is on and the
+        BM25 text is identical to the embedding text (the common case), we
+        store only one copy with `text_for_bm25=NULL` — readers fall through
+        to `text_for_embedding`. Reserves the column for future cases where
+        BM25 wants different text from the dense side."""
+        return self.text_for_bm25 or self.text_for_embedding or self.text
 
 
 @dataclass

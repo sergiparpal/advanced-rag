@@ -198,6 +198,26 @@ def test_convo_ring_buffer_holds_last_n(monkeypatch):
     assert np.allclose(ring[0], [0.5, 0.5])
 
 
+def test_convo_evicts_least_recently_used_session(monkeypatch):
+    """The session dict is LRU-capped at _MAX_RINGS — otherwise a
+    long-running Hermes process leaks one ring per distinct session_id."""
+    monkeypatch.setattr(convo_mod, "_MAX_RINGS", 3)
+    convo_mod.reset_for_tests()
+
+    convo_mod.push("a", np.array([1.0, 0.0], dtype=np.float32))
+    convo_mod.push("b", np.array([0.0, 1.0], dtype=np.float32))
+    convo_mod.push("c", np.array([1.0, 1.0], dtype=np.float32))
+    # Touching "a" promotes it to most-recently-used; "b" is now LRU.
+    convo_mod.push("a", np.array([0.5, 0.5], dtype=np.float32))
+    # Adding a fourth session evicts "b".
+    convo_mod.push("d", np.array([0.2, 0.8], dtype=np.float32))
+
+    assert convo_mod.get_ring("a")  # kept
+    assert convo_mod.get_ring("c")  # kept
+    assert convo_mod.get_ring("d")  # newest
+    assert convo_mod.get_ring("b") == []  # evicted
+
+
 def test_convo_mix_with_empty_history_returns_current():
     cur = np.array([0.6, 0.8], dtype=np.float32)
     out = convo_mod.mix_with_history(cur, [])
